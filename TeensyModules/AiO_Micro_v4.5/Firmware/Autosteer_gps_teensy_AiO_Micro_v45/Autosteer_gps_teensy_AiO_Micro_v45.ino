@@ -44,6 +44,10 @@ const int32_t baudRTK = 9600;     // most are using Xbee radios with default of 
 #define COAST_IMU_YAW_SIGN           1.0f      // +1 if TM171 yaw grows clockwise (compass sense), else -1
 #define COAST_IMU_ROLL_SIGN          1.0f      // +1 if TM171 roll is positive right-side-down (AOG sense), else -1
 #define COAST_DUAL_HEADING_OFFSET_DEG COAST_AUTO_OFFSET  // KSXT heading -> vehicle heading; AUTO learns 0/90/180/270
+// Phase 2 (curve / slope). Both can be switched off to A/B them in the $COASTSHADOW numbers.
+#define COAST_SPEED_OBSERVER         true      // on turns, track speed from yawrate * L_eff / tan(steer angle)
+#define COAST_CRAB_MODEL             true      // slip crab follows k * sin(roll), k learned on side slopes
+#define COAST_WAS_SIGN               0.0f      // +1 if positive WAS = right turn, -1 if left, 0 = learn from the gyro
 
 // Baudrates for detecting UBX receiver
 uint32_t baudrates[]

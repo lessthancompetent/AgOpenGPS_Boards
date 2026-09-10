@@ -1,11 +1,14 @@
-// Dead-reckoning coast: firmware glue around zCoastCore (Phase 0).
+// Dead-reckoning coast: firmware glue around zCoastCore (Phase 0 shadow mode + Phase 2 models).
 //
-// Phase 0 changes NOTHING that AgIO receives. It parses KSXT, feeds the coast core, runs the
+// Nothing AgIO receives is changed. The firmware parses KSXT, feeds the coast core, runs the
 // estimator in shadow mode against live GNSS, and prints its error on USB:
 //
-//   $COASTSHADOW,dur_s,dist_m,along_m,cross_m,maxAlong_m,maxCross_m,delta_deg,offset_deg,beta_deg,vStart,vEnd,fixes
-//       one line per shadow window (default every 20 s while moving with an RTK fix + TM171)
-//   $COAST,t_ms,lat,lon,posq,hdgq,hdg_raw,track,v_mps,dual_roll,yaw,roll,pitch,was_deg,delta,offset,active,along,cross
+//   $COASTSHADOW,dur_s,dist_m,along_m,cross_m,maxAlong_m,maxCross_m,delta_deg,offset_deg,beta_deg,
+//                vStart,vEnd,fixes,Leff_m,k_crab,wasSign,obsFrac
+//       one line per shadow window (default every 20 s while moving with an RTK fix + TM171).
+//       cross_m is the number that matters for steering. Leff/k/wasSign are 0 until learned.
+//   $COAST,t_ms,lat,lon,posq,hdgq,hdg_raw,track,v_mps,dual_roll,yaw,roll,pitch,was_deg,delta,offset,
+//          active,along,cross,Leff,k
 //       one line per KSXT when COAST_LOG_USB is true (10 Hz), for offline replay with tests/coast/coast_ref.py
 //
 // Settings live in the user-settings block of the main sketch. Design: docs/dead_reckoning_coast_design.md
@@ -18,6 +21,7 @@ bool coastInitDone = false;
 void coastInit()
 {
   coast_config_t cfg;
+  memset(&cfg, 0, sizeof(cfg));
   cfg.wheelbase_m             = COAST_WHEELBASE_M;
   cfg.antenna_fwd_m           = COAST_ANTENNA_FWD_M;
   cfg.antenna_height_m        = COAST_ANTENNA_HEIGHT_M;
@@ -26,6 +30,9 @@ void coastInit()
   cfg.dual_heading_offset_deg = COAST_DUAL_HEADING_OFFSET_DEG;
   cfg.shadow_window_s         = COAST_SHADOW_WINDOW_S;
   cfg.min_speed_mps           = 0.5f;
+  cfg.was_sign                = COAST_WAS_SIGN;
+  cfg.speed_observer          = COAST_SPEED_OBSERVER;
+  cfg.crab_model              = COAST_CRAB_MODEL;
   coast_init(&coastState, &cfg);
   coastInitDone = true;
 
@@ -35,11 +42,17 @@ void coastInit()
   Serial.print(COAST_LOG_USB ? "ON" : "OFF");
   Serial.print(", window ");
   Serial.print(COAST_SHADOW_WINDOW_S);
-  Serial.print(" s, a=");
+  Serial.print(" s, L=");
+  Serial.print(COAST_WHEELBASE_M);
+  Serial.print(" a=");
   Serial.print(COAST_ANTENNA_FWD_M);
-  Serial.print(" m, h=");
+  Serial.print(" h=");
   Serial.print(COAST_ANTENNA_HEIGHT_M);
-  Serial.println(" m. Output to AgIO is unchanged in Phase 0.");
+  Serial.print(" m, speed observer ");
+  Serial.print(COAST_SPEED_OBSERVER ? "ON" : "OFF");
+  Serial.print(", crab model ");
+  Serial.print(COAST_CRAB_MODEL ? "ON" : "OFF");
+  Serial.println(". Output to AgIO is unchanged.");
 }
 
 // Called from TM171.ino for every function-code-35 packet.
@@ -88,7 +101,11 @@ void coastOnKSXT(uint32_t t_ms, double lat, double lon, float alt, int posQ, int
     Serial.print(r->beta_deg, 2);               Serial.print(",");
     Serial.print(r->v_start_mps, 2);            Serial.print(",");
     Serial.print(r->v_end_mps, 2);              Serial.print(",");
-    Serial.println(r->fix_count);
+    Serial.print(r->fix_count);                 Serial.print(",");
+    Serial.print(r->leff_m, 3);                 Serial.print(",");
+    Serial.print(r->k_crab, 2);                 Serial.print(",");
+    Serial.print(r->was_sign, 0);               Serial.print(",");
+    Serial.println(r->observer_frac, 2);
     coastState.report_ready = false;
   }
 
@@ -112,6 +129,8 @@ void coastOnKSXT(uint32_t t_ms, double lat, double lon, float alt, int posQ, int
     Serial.print(coastState.quad_valid ? coastState.quad_offset_deg : 999);  Serial.print(",");
     Serial.print(coastState.active ? 1 : 0); Serial.print(",");
     Serial.print(coastState.along_m, 3);     Serial.print(",");
-    Serial.println(coastState.cross_m, 3);
+    Serial.print(coastState.cross_m, 3);     Serial.print(",");
+    Serial.print(coastState.leff_valid ? coastState.leff_m : 0.0f, 3); Serial.print(",");
+    Serial.println(coastState.k_valid ? coastState.k_crab : 0.0f, 2);
   }
 }

@@ -1,4 +1,4 @@
-// Dead-reckoning coast core (Phase 0). See zCoastCore.h and the design doc.
+// Dead-reckoning coast core (Phase 0 + Phase 2). See zCoastCore.h and the design doc.
 #include "zCoastCore.h"
 #include <math.h>
 #include <string.h>
@@ -7,6 +7,24 @@
 #define RAD2DEG 57.29577951308232
 #define WGS84_A 6378137.0
 #define WGS84_E2 0.00669437999014
+
+// Thresholds shared by learning and the observer
+#define TURN_MIN_WAS_DEG     5.0f
+#define TURN_MIN_RATE_DPS    2.0f
+#define LEARN_MIN_SPEED_MPS  1.0f
+#define CRAB_MIN_ROLL_DEG    3.0f
+#define CRAB_MAX_ROLL_RATE_DPS 3.0f
+#define K_CRAB_LIMIT_DEG     30.0f
+#define LEFF_TAU_S           10.0f
+#define K_TAU_S              10.0f
+#define SLIP_TAU_S           1.0f
+#define RES_TAU_S            5.0f
+#define OBS_TAU_S            0.25f
+#define OBS_MAX_ACCEL_MPS2   1.5f
+#define OBS_MAX_SPEED_RATIO  1.25f
+#define WAS_SIGN_MIN_VOTES   20
+#define LEFF_MIN_SAMPLES     10
+#define K_MIN_SAMPLES        50
 
 float coast_wrap180(float a)
 {
@@ -43,6 +61,8 @@ void coast_init(coast_t *c, const coast_config_t *cfg)
     c->quad_offset_deg = (int)lroundf(c->cfg.dual_heading_offset_deg);
     c->quad_valid = true;
   }
+  if (c->cfg.was_sign > 0.0f)      { c->was_sign = 1.0f;  c->was_sign_valid = true; }
+  else if (c->cfg.was_sign < 0.0f) { c->was_sign = -1.0f; c->was_sign_valid = true; }
 }
 
 float coast_vehicle_heading(const coast_t *c, float hdg_raw_deg)
@@ -63,6 +83,16 @@ static void axle_from_antenna(const coast_t *c, float psi_deg, float roll_deg, d
 
 static float imu_roll(const coast_t *c) { return c->cfg.imu_roll_sign * c->roll_deg; }
 static float imu_yaw(const coast_t *c)  { return c->cfg.imu_yaw_sign * c->yaw_deg; }
+static float antenna_lateral_mps(const coast_t *c);
+static float axle_speed(const coast_t *c, float v_antenna_mps);
+
+static bool turning(const coast_t *c, float *delta_deg)
+{
+  if (!c->was_valid || !c->was_sign_valid) return false;
+  float d = c->was_sign * c->was_deg;
+  *delta_deg = d;
+  return fabsf(d) > TURN_MIN_WAS_DEG && fabsf(c->yaw_rate_dps) > TURN_MIN_RATE_DPS;
+}
 
 void coast_imu(coast_t *c, uint32_t t_us, float yaw_deg, float roll_deg, float pitch_deg)
 {
@@ -74,10 +104,39 @@ void coast_imu(coast_t *c, uint32_t t_us, float yaw_deg, float roll_deg, float p
       float rate = c->cfg.imu_yaw_sign * coast_wrap180(yaw_deg - c->yaw_deg) / dt;
       float alpha = dt / (dt + 0.05f);           // 50 ms low-pass
       c->yaw_rate_dps += (rate - c->yaw_rate_dps) * alpha;
+      float rrate = c->cfg.imu_roll_sign * (roll_deg - c->roll_deg) / dt;
+      c->roll_rate_dps += (rrate - c->roll_rate_dps) * alpha;
 
       if (c->active)
       {
         c->psi_deg = coast_wrap360(c->cfg.imu_yaw_sign * yaw_deg + c->delta_frozen_deg);
+
+        // crab: k*sin(roll_now) + residual (which decays toward the model), or the frozen entry value
+        float rollc = c->cfg.imu_roll_sign * roll_deg;
+        if (c->cfg.crab_model && c->k_valid)
+        {
+          c->beta_res_deg -= c->beta_res_deg * (dt / (RES_TAU_S + dt));
+          c->beta_deg = c->k_crab * sinf(rollc * (float)DEG2RAD) + c->beta_res_deg;
+        }
+        else
+          c->beta_deg = c->beta_res_deg;
+
+        // speed observer on turns
+        float d;
+        if (c->cfg.speed_observer && c->leff_valid && turning(c, &d))
+        {
+          float v_obs = fabsf(c->yaw_rate_dps * (float)DEG2RAD * c->leff_m / tanf(d * (float)DEG2RAD));
+          float a_obs = dt / (dt + OBS_TAU_S);
+          float dv = (v_obs - c->v_mps) * a_obs;
+          float lim = OBS_MAX_ACCEL_MPS2 * dt;
+          if (dv > lim) dv = lim; else if (dv < -lim) dv = -lim;
+          c->v_mps += dv;
+          if (c->v_mps < 0.0f) c->v_mps = 0.0f;
+          if (c->v_mps > OBS_MAX_SPEED_RATIO * c->v_start_mps) c->v_mps = OBS_MAX_SPEED_RATIO * c->v_start_mps;
+          c->obs_samples++;
+        }
+        c->int_samples++;
+
         float chi = (c->psi_deg + c->beta_deg) * (float)DEG2RAD;
         c->n_m += (double)(c->v_mps * cosf(chi) * dt);
         c->e_m += (double)(c->v_mps * sinf(chi) * dt);
@@ -115,7 +174,7 @@ bool coast_predict_antenna(const coast_t *c, double *lat_deg, double *lon_deg)
 static void learn_quadrant(coast_t *c, const coast_fix_t *fix)
 {
   if (c->cfg.dual_heading_offset_deg != COAST_AUTO_OFFSET) return;
-  if (fix->hdg_q != 3 || fix->v_mps < 1.0f) return;
+  if (fix->hdg_q != 3 || fix->v_mps < LEARN_MIN_SPEED_MPS) return;
   float r = coast_wrap180(fix->track_deg - fix->hdg_raw_deg);
   int q = (int)lroundf(r / 90.0f);
   q = ((q % 4) + 4) % 4;
@@ -151,17 +210,141 @@ static void learn_delta(coast_t *c, const coast_fix_t *fix)
   c->delta_t_ms = fix->t_ms;
 }
 
+// WAS sign + effective wheelbase from turns: L = v * tan(delta) / yawrate
+static void learn_wheelbase(coast_t *c, const coast_fix_t *fix)
+{
+  if (!c->imu_valid || !c->was_valid || fix->v_mps < LEARN_MIN_SPEED_MPS) return;
+  if (fabsf(c->was_deg) <= TURN_MIN_WAS_DEG || fabsf(c->yaw_rate_dps) <= TURN_MIN_RATE_DPS) return;
+
+  if (c->cfg.was_sign == 0.0f)
+  {
+    bool same = (c->was_deg > 0.0f) == (c->yaw_rate_dps > 0.0f);
+    if (same) c->was_votes_pos++; else c->was_votes_neg++;
+    int hi = c->was_votes_pos > c->was_votes_neg ? c->was_votes_pos : c->was_votes_neg;
+    int total = c->was_votes_pos + c->was_votes_neg;
+    if (hi >= WAS_SIGN_MIN_VOTES && hi * 10 >= total * 8)
+    {
+      float s = c->was_votes_pos >= c->was_votes_neg ? 1.0f : -1.0f;
+      if (!c->was_sign_valid || s != c->was_sign) { c->leff_valid = false; c->leff_n = 0; }
+      c->was_sign = s; c->was_sign_valid = true;
+    }
+  }
+  if (!c->was_sign_valid) return;
+
+  float d = c->was_sign * c->was_deg;
+  float l_obs = axle_speed(c, fix->v_mps) * tanf(d * (float)DEG2RAD) / (c->yaw_rate_dps * (float)DEG2RAD);
+  float L = c->cfg.wheelbase_m;
+  if (!(l_obs > 0.3f * L && l_obs < 3.0f * L)) return;   // wrong sign or nonsense: skip
+
+  if (c->leff_n == 0)
+  {
+    c->leff_m = l_obs;
+  }
+  else
+  {
+    float dt = (float)(fix->t_ms - c->leff_t_ms) * 1e-3f;
+    if (dt <= 0.0f || dt > 2.0f) dt = 0.1f;
+    float alpha = dt / (dt + LEFF_TAU_S);
+    c->leff_m += (l_obs - c->leff_m) * alpha;
+  }
+  if (c->leff_m < 0.5f * L) c->leff_m = 0.5f * L;
+  if (c->leff_m > 2.0f * L) c->leff_m = 2.0f * L;
+  c->leff_t_ms = fix->t_ms;
+  c->leff_n++;
+  if (c->leff_n >= LEFF_MIN_SAMPLES) c->leff_valid = true;
+}
+
+// Antenna velocity relative to the axle, in the vehicle frame (ignoring slip):
+//   along = v_axle - hr*yawrate,  lateral = a*yawrate + h*cos(roll)*rollrate,  hr = h*sin(roll)
+// The KSXT speed is the antenna's, so the axle speed is recovered from it, and the geometric
+// part of (track - heading) is removed before anything is called "slip".
+static float antenna_lateral_mps(const coast_t *c)
+{
+  float rollc = imu_roll(c) * (float)DEG2RAD;
+  return c->cfg.antenna_fwd_m * c->yaw_rate_dps * (float)DEG2RAD
+       + c->cfg.antenna_height_m * cosf(rollc) * c->roll_rate_dps * (float)DEG2RAD;
+}
+
+static float axle_speed(const coast_t *c, float v_antenna_mps)
+{
+  float hr = c->cfg.antenna_height_m * sinf(imu_roll(c) * (float)DEG2RAD);
+  float lat = antenna_lateral_mps(c);
+  float along2 = v_antenna_mps * v_antenna_mps - lat * lat;
+  float along = along2 > 0.0f ? sqrtf(along2) : 0.0f;
+  float v = along + hr * c->yaw_rate_dps * (float)DEG2RAD;
+  return v > 0.0f ? v : 0.0f;
+}
+
+// Slip crab of the axle: (track - vehicle heading) minus the geometric crab of the antenna
+static float slip_crab(const coast_t *c, const coast_fix_t *fix)
+{
+  float veh = coast_vehicle_heading(c, fix->hdg_raw_deg);
+  float beta_total = coast_wrap180(fix->track_deg - veh);
+  float hr = c->cfg.antenna_height_m * sinf(imu_roll(c) * (float)DEG2RAD);
+  float along = axle_speed(c, fix->v_mps) - hr * c->yaw_rate_dps * (float)DEG2RAD;
+  float beta_kin = (float)(atan2((double)antenna_lateral_mps(c), (double)along) * RAD2DEG);
+  return coast_wrap180(beta_total - beta_kin);
+}
+
+// Low-passed slip crab (1 s): the KSXT track is noisy sample to sample, the crab is not.
+static void update_slip(coast_t *c, const coast_fix_t *fix)
+{
+  if (!c->quad_valid || !c->imu_valid || fix->hdg_q != 3 || fix->v_mps < LEARN_MIN_SPEED_MPS) return;
+  float raw = slip_crab(c, fix);
+  if (!c->beta_slip_valid)
+  {
+    c->beta_slip_filt_deg = raw; c->beta_slip_valid = true;
+  }
+  else
+  {
+    float dt = (float)(fix->t_ms - c->beta_slip_t_ms) * 1e-3f;
+    if (dt <= 0.0f || dt > 2.0f) dt = 0.1f;
+    float alpha = dt / (dt + SLIP_TAU_S);
+    c->beta_slip_filt_deg += coast_wrap180(raw - c->beta_slip_filt_deg) * alpha;
+  }
+  c->beta_slip_t_ms = fix->t_ms;
+}
+
+// Crab gain k = slip crab / sin(roll) on side slopes
+static void learn_crab(coast_t *c, const coast_fix_t *fix)
+{
+  if (!c->beta_slip_valid || fix->hdg_q != 3 || fix->v_mps < LEARN_MIN_SPEED_MPS) return;
+  float rollc = imu_roll(c);
+  if (fabsf(rollc) <= CRAB_MIN_ROLL_DEG) return;
+  if (fabsf(c->roll_rate_dps) > CRAB_MAX_ROLL_RATE_DPS) return;   // antenna swinging: track is not crab
+  float k_obs = c->beta_slip_filt_deg / sinf(rollc * (float)DEG2RAD);
+  if (k_obs > K_CRAB_LIMIT_DEG) k_obs = K_CRAB_LIMIT_DEG;
+  if (k_obs < -K_CRAB_LIMIT_DEG) k_obs = -K_CRAB_LIMIT_DEG;
+
+  if (c->k_n == 0)
+  {
+    c->k_crab = k_obs;
+  }
+  else
+  {
+    float dt = (float)(fix->t_ms - c->k_t_ms) * 1e-3f;
+    if (dt <= 0.0f || dt > 2.0f) dt = 0.1f;
+    float alpha = dt / (dt + K_TAU_S);
+    c->k_crab += (k_obs - c->k_crab) * alpha;
+  }
+  c->k_t_ms = fix->t_ms;
+  c->k_n++;
+  if (c->k_n >= K_MIN_SAMPLES) c->k_valid = true;
+}
+
 static void start_window(coast_t *c, const coast_fix_t *fix)
 {
   c->delta_frozen_deg = c->delta_deg;
   c->psi_deg = coast_wrap360(imu_yaw(c) + c->delta_frozen_deg);
-  c->v_mps = fix->v_mps;
+  c->v_mps = axle_speed(c, fix->v_mps);
+  c->v_start_mps = c->v_mps;
 
-  // slip crab = (track - vehicle heading) - geometric crab of the antenna while turning
-  float veh = coast_vehicle_heading(c, fix->hdg_raw_deg);
-  float beta_total = coast_wrap180(fix->track_deg - veh);
-  float beta_kin = (float)(atan2((double)(c->cfg.antenna_fwd_m * c->yaw_rate_dps * (float)DEG2RAD), (double)fix->v_mps) * RAD2DEG);
-  c->beta_deg = coast_wrap180(beta_total - beta_kin);
+  c->beta_entry_deg = c->beta_slip_valid ? c->beta_slip_filt_deg : slip_crab(c, fix);
+  if (c->cfg.crab_model && c->k_valid)
+    c->beta_res_deg = c->beta_entry_deg - c->k_crab * sinf(imu_roll(c) * (float)DEG2RAD);
+  else
+    c->beta_res_deg = c->beta_entry_deg;
+  c->beta_deg = c->beta_entry_deg;
 
   c->lat0_deg = fix->lat_deg; c->lon0_deg = fix->lon_deg;
   coast_earth_radii(c->lat0_deg, &c->rm_m, &c->rn_m);
@@ -173,6 +356,7 @@ static void start_window(coast_t *c, const coast_fix_t *fix)
   c->along_m = c->cross_m = 0.0f;
   c->max_abs_along_m = c->max_abs_cross_m = 0.0f;
   c->fix_count = 0;
+  c->int_samples = c->obs_samples = 0;
   c->active = true;
 }
 
@@ -199,9 +383,13 @@ static void finish_window(coast_t *c, const coast_fix_t *fix)
   r->max_abs_along_m = c->max_abs_along_m; r->max_abs_cross_m = c->max_abs_cross_m;
   r->delta_deg = c->delta_frozen_deg;
   r->offset_deg = c->quad_offset_deg;
-  r->beta_deg = c->beta_deg;
-  r->v_start_mps = c->v_mps; r->v_end_mps = fix->v_mps;
+  r->beta_deg = c->beta_entry_deg;
+  r->v_start_mps = c->v_start_mps; r->v_end_mps = fix->v_mps;
   r->fix_count = c->fix_count;
+  r->leff_m = c->leff_valid ? c->leff_m : 0.0f;
+  r->k_crab = c->k_valid ? c->k_crab : 0.0f;
+  r->was_sign = c->was_sign_valid ? c->was_sign : 0.0f;
+  r->observer_frac = c->int_samples ? (float)c->obs_samples / (float)c->int_samples : 0.0f;
   c->report_ready = true;
   c->active = false;
 }
@@ -211,13 +399,16 @@ void coast_gnss(coast_t *c, const coast_fix_t *fix)
   bool good = (fix->pos_q == 3);
   if (!good)
   {
-    // Phase 0: a real loss just interrupts the shadow window. Abandon it if the gap grows.
+    // Phase 0/2: a real loss just interrupts the shadow window. Abandon it if the gap grows.
     if (c->active && c->last_valid && (fix->t_ms - c->last.t_ms) > 1000) c->active = false;
     return;
   }
 
   learn_quadrant(c, fix);
   learn_delta(c, fix);
+  learn_wheelbase(c, fix);
+  update_slip(c, fix);
+  learn_crab(c, fix);
 
   if (c->active)
   {

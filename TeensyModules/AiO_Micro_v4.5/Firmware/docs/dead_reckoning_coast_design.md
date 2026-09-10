@@ -2,7 +2,14 @@
 
 Firmware feature for the AiO Micro v4.5 port (UM982 + TM171 + Keya). 2026-09-10.
 
-**Status: Phase 0 implemented** (KSXT parsing, USB logging, shadow mode; nothing AgIO receives is changed). Phases 1–3 are design only. Code: `zCoastCore.h/.c` (pure C core, also built by `tests/coast/run_tests.sh` against the Python reference model), `zCoast.ino` (glue), settings in the main sketch's user-settings block.
+**Status: Phases 0 and 2 implemented** (KSXT parsing, USB logging, shadow mode, speed observer, wheelbase self-calibration with WAS-sign detection, crab model; nothing AgIO receives is changed). Phase 1 (live coast output) and Phase 3 (speed pulse) are design only. Code: `zCoastCore.h/.c` (pure C core, also built by `tests/coast/run_tests.sh` against the Python reference model), `zCoast.ino` (glue), settings in the main sketch's user-settings block.
+
+**Findings from the synthetic drive (see §11 for how to read real numbers):**
+
+- The KSXT track angle and speed belong to the *antenna*, not the axle. On a rolled turn the antenna sits `h·sin φ` inside the turn and, whenever the roll changes, swings sideways at `h·cos φ·φ̇`. Both terms are now removed before anything is called crab or used to learn the wheelbase; without that the learned crab gain was off by 60 % after every roll ramp.
+- The measured slip crab is low-passed over 1 s before it is used at window entry or for learning `k`; a single 10 Hz KSXT sample is too noisy.
+- With a valid `k`, the entry residual decays toward the `k·sin φ` model with τ = 5 s, so a noisy entry value does not get carried onto flat ground.
+- On a straight there is nothing to observe speed from, so an acceleration after a curve shows up as several metres of along-track error. It converts to cross-track only when the next curve begins (`s²/2R`). This is the Phase 3 case: only a speed pulse fixes it.
 
 ## 1. Problem
 

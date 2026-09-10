@@ -1,4 +1,4 @@
-scenario.csv
+*.csv
 *.out
 *.exe
 coast_host_test
