@@ -36,7 +36,11 @@ const int32_t baudRTK = 9600;     // most are using Xbee radios with default of 
 // Phase 0 = shadow mode only: the estimator runs against live GNSS and prints $COASTSHADOW lines on USB.
 // Nothing AgIO receives is changed. Geometry MUST match the AgOpenGPS vehicle settings.
 #define COAST_SHADOW_MODE            true      // run the shadow estimator
-#define COAST_LOG_USB                false     // 10 Hz $COAST log lines on USB for offline replay
+#define COAST_LOG                    false     // 10 Hz $COAST log lines (USB + UDP log port) for offline replay
+#define COAST_UDP_LOG_PORT           5125      // all coast diagnostic lines are also broadcast here (0 = off); tests/coast/coast_monitor.py
+#define COAST_DISPLAY_SHADOW         true      // show each shadow window result as an AgOpenGPS hardware message (PGN 221)
+#define STR_(x) #x
+#define STR(x) STR_(x)
 #define COAST_SHADOW_WINDOW_S        20.0f     // shadow window length, seconds
 // Geometry from the AgOpenGPS vehicle profile "6480" (VehicleProfiles/6480.xml, 2026-08-23). Keep in step with it.
 #define COAST_WHEELBASE_M            2.8f      // L  -- setVehicle_wheelbase
@@ -646,8 +650,7 @@ void loop()
                     args[n++] = ch;
                 }
                 args[n] = 0;
-                if (aogSerialCmdBuffer[aogSerialCmdCounter + 1] == 'O') coastForce(atoi(args[0] == ',' ? args + 1 : args));
-                else coastGeometryCommand(args);
+                coastCommand(aogSerialCmdBuffer[aogSerialCmdCounter + 1], args);
                 aogSerialCmdCounter = 0;
             }
         }

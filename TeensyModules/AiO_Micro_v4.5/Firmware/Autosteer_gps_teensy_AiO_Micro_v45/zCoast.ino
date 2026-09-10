@@ -1,6 +1,6 @@
 // Dead-reckoning coast: firmware glue around zCoastCore.
 //
-// Shadow mode (always, when COAST_SHADOW_MODE): the estimator runs against live GNSS and prints
+// Shadow mode (always, when COAST_SHADOW_MODE): the estimator runs against live GNSS and reports
 //   $COASTSHADOW,dur_s,dist_m,along_m,cross_m,maxAlong_m,maxCross_m,delta_deg,offset_deg,beta_deg,
 //                vStart,vEnd,fixes,Leff_m,k_crab,wasSign,obsFrac,extFrac,extScale
 //   one line per window. cross_m is the number that matters for steering.
@@ -10,8 +10,16 @@
 //   sensors fail. On timeout one quality-0 sentence is sent so AgOpenGPS disengages as it does today.
 //   $COASTREPORT,reason,dur_s,dist_m,along_m,cross_m,vStart,forced,fallback
 //   reason: 1 recovered, 2 timeout, 3 sensor loss. along/cross = first real fix minus the coasted position.
-// Field test: "!AOGCO,10" on USB forces a 10 s coast while GNSS is good; the report then holds the true error.
-// Optional 10 Hz log: $COAST,... (COAST_LOG_USB) for offline replay with tests/coast/coast_ref.py.
+//
+// Where the diagnostics go (no USB needed in the tractor):
+//   - USB serial, as before
+//   - UDP broadcast on COAST_UDP_LOG_PORT (every line; capture with tests/coast/coast_monitor.py)
+//   - AgOpenGPS hardware message (PGN 221) for reports, coast start/end and geometry changes: shown on
+//     the AgOpenGPS screen when "Hardware Messages" is enabled, and written to its event log
+// Commands, any of: USB serial, UDP text to the module's port 8888, or AgOpenGPS PGN 210 (Coast button):
+//   "!AOGCO,10"                   force a 10 s coast while GNSS is good (report then holds the true error)
+//   "!AOGCG,L,pivot,height,offset" set the vehicle geometry (metres, AgOpenGPS signs)
+// Optional 10 Hz log: $COAST,... (COAST_LOG) for offline replay with tests/coast/coast_ref.py.
 //
 // Settings live in the user-settings block of the main sketch. Design: docs/dead_reckoning_coast_design.md
 
@@ -22,6 +30,7 @@ extern char numSats[4];
 
 coast_t coastState;
 bool coastInitDone = false;
+bool coastWasLive = false;
 
 // Last KSXT fields kept as strings for the synthetic-KSXT output (filled by KSXT_Handler)
 char coastKsxtUtc[24] = "";
@@ -33,6 +42,40 @@ coast_out_t coastLastOut;
 bool coastLastOutValid = false;
 uint32_t coastLastEmitMs = 0;
 
+// ----------------------------------------------------------------------------- transport
+// One diagnostic line: USB + UDP broadcast on the log port
+void coastSendText(const char *line)
+{
+  Serial.println(line);
+  if (Ethernet_running && COAST_UDP_LOG_PORT > 0)
+  {
+    IPAddress bcast(networkAddress.ipOne, networkAddress.ipTwo, networkAddress.ipThree, 255);
+    Eth_udpPAOGI.beginPacket(bcast, COAST_UDP_LOG_PORT);
+    Eth_udpPAOGI.write((const uint8_t *)line, strlen(line));
+    Eth_udpPAOGI.write((const uint8_t *)"\r\n", 2);
+    Eth_udpPAOGI.endPacket();
+  }
+}
+
+// AgOpenGPS hardware message, PGN 221: { 0x80, 0x81, 126, 221, len, seconds, colour, text..., crc }
+void coastSendDisplay(const char *text, uint8_t seconds, bool alarm)
+{
+  if (!Ethernet_running) return;
+  uint8_t pkt[100];
+  size_t n = strlen(text);
+  if (n > 80) n = 80;
+  pkt[0] = 0x80; pkt[1] = 0x81; pkt[2] = 126; pkt[3] = 221;
+  pkt[4] = (uint8_t)(n + 2);
+  pkt[5] = seconds;
+  pkt[6] = alarm ? 0 : 1;          // 0 = salmon, other = bisque
+  memcpy(pkt + 7, text, n);
+  int16_t crc = 0;
+  for (size_t i = 2; i < 7 + n; i++) crc += pkt[i];
+  pkt[7 + n] = (uint8_t)crc;
+  SendUdp(pkt, (uint8_t)(8 + n), Eth_ipDestination, portDestination);
+}
+
+// ----------------------------------------------------------------------------- geometry
 // Vehicle geometry: compile-time defaults < EEPROM (last value received) < AgOpenGPS PGN 209 / "!AOGCG" command
 #define COAST_EE_ADDR  100          // steer settings use 0..70
 #define COAST_EE_IDENT 0xC0A5
@@ -43,13 +86,16 @@ void coastApplyGeometry(float L, float a, float h, float offsetAog, const char *
 {
   if (!coastInitDone) coastInit();
   bool ok = coast_set_geometry(&coastState, L, a, h, -offsetAog);
-  Serial.print("$COASTMSG,geometry ");
-  Serial.print(ok ? (coastState.geom_pending ? "queued (coast running)" : "applied") : "REJECTED");
-  Serial.print(" from "); Serial.print(source);
-  Serial.print(": L="); Serial.print(L, 2);
-  Serial.print(" pivot="); Serial.print(a, 2);
-  Serial.print(" height="); Serial.print(h, 2);
-  Serial.print(" offset="); Serial.println(offsetAog, 2);
+  char msg[120];
+  snprintf(msg, sizeof(msg), "$COASTMSG,geometry %s from %s: L=%.2f pivot=%.2f height=%.2f offset=%.2f",
+           ok ? (coastState.geom_pending ? "queued" : "applied") : "REJECTED", source, L, a, h, offsetAog);
+  coastSendText(msg);
+  if (save)
+  {
+    snprintf(msg, sizeof(msg), "Coast geometry %s: L %.2f pivot %.2f h %.2f offs %.2f",
+             ok ? "set" : "REJECTED", L, a, h, offsetAog);
+    coastSendDisplay(msg, 5, !ok);
+  }
   if (!ok || !save) return;
 
   CoastGeomEE ee;
@@ -63,10 +109,10 @@ void coastApplyGeometry(float L, float a, float h, float offsetAog, const char *
   if (memcmp(&cur, &ee, sizeof(ee)) != 0) EEPROM.put(COAST_EE_ADDR, ee);   // only write on change
 }
 
-// "!AOGCG,L,pivot,height,offset" (metres, AOG signs)
+// ",L,pivot,height,offset" (metres, AOG signs)
 void coastGeometryCommand(const char *args)
 {
-  // ",L,a,h,o" -> four floats (strtof, not sscanf: %f scanning costs ~28 KB of flash)
+  // four floats via strtof (sscanf %f costs ~28 KB of flash)
   float v[4];
   const char *p = args;
   int n = 0;
@@ -79,10 +125,61 @@ void coastGeometryCommand(const char *args)
     n++;
     p = end;
   }
-  if (n == 4) coastApplyGeometry(v[0], v[1], v[2], v[3], "USB !AOGCG", true);
-  else Serial.println("$COASTMSG,usage: !AOGCG,wheelbase,antennaPivot,antennaHeight,antennaOffset (m)");
+  if (n == 4) coastApplyGeometry(v[0], v[1], v[2], v[3], "!AOGCG", true);
+  else coastSendText("$COASTMSG,usage: !AOGCG,wheelbase,antennaPivot,antennaHeight,antennaOffset (m)");
 }
 
+// ----------------------------------------------------------------------------- commands
+void coastForce(int seconds)
+{
+  if (!coastInitDone) coastInit();
+  char msg[80];
+  if (!COAST_LIVE_ENABLE)
+  {
+    coastSendText("$COASTMSG,forced coast ignored: COAST_LIVE_ENABLE is false");
+    coastSendDisplay("Coast test ignored: live coast is off in this build", 5, true);
+    return;
+  }
+  coast_force(&coastState, millis(), (float)seconds);
+  snprintf(msg, sizeof(msg), "$COASTMSG,forced coast for %d s", seconds);
+  coastSendText(msg);
+  snprintf(msg, sizeof(msg), "Coast test: %d s forced coast starting", seconds);
+  coastSendDisplay(msg, 4, false);
+}
+
+// code 'O' = force (args ",seconds"), 'G' = geometry (args ",L,a,h,o"). Shared by USB and UDP.
+void coastCommand(char code, const char *args)
+{
+  if (code == 'O')
+  {
+    const char *p = args;
+    if (*p == ',') p++;
+    coastForce(atoi(p));
+  }
+  else if (code == 'G')
+  {
+    coastGeometryCommand(args);
+  }
+}
+
+// "!AOGCO,10" or "!AOGCG,..." arriving as text on the module's UDP port
+void coastUdpCommand(const uint8_t *data, int len)
+{
+  char buf[64];
+  int n = len < 63 ? len : 63;
+  memcpy(buf, data, n);
+  buf[n] = 0;
+  for (int i = 0; i < n; i++) if (buf[i] == '\r' || buf[i] == '\n') { buf[i] = 0; break; }
+  if (n >= 6 && buf[4] == 'C') coastCommand(buf[5], buf + 6);
+}
+
+// AgOpenGPS PGN 210: cmd 1 = forced coast for <value> seconds
+void coastOnPgn210(uint8_t cmd, uint16_t value)
+{
+  if (cmd == 1) coastForce((int)value);
+}
+
+// ----------------------------------------------------------------------------- pulse input
 // Ground-speed pulse input (Phase 3). Counted in an interrupt, sampled every 50 ms.
 #if COAST_SPEED_PULSE_PIN >= 0
 volatile uint32_t coastPulseCount = 0;
@@ -102,6 +199,7 @@ uint32_t coastPulsePrevUs = 0;
 float    coastPulseSpeed = 0.0f;
 elapsedMillis coastPulseTimer;
 
+// ----------------------------------------------------------------------------- init
 void coastInit()
 {
   coast_config_t cfg;
@@ -134,7 +232,7 @@ void coastInit()
   }
   else
   {
-    Serial.println("$COASTMSG,geometry from compile-time defaults (no EEPROM value yet)");
+    coastSendText("$COASTMSG,geometry from compile-time defaults (no EEPROM value yet)");
   }
 
 #if COAST_SPEED_PULSE_PIN >= 0
@@ -142,36 +240,16 @@ void coastInit()
   attachInterrupt(digitalPinToInterrupt(COAST_SPEED_PULSE_PIN), coastPulseIsr, RISING);
 #endif
 
-  Serial.print("Coast: shadow ");
-  Serial.print(COAST_SHADOW_MODE ? "ON" : "OFF");
-  Serial.print(", LIVE ");
-  Serial.print(COAST_LIVE_ENABLE ? "ON" : "OFF");
-  if (COAST_LIVE_ENABLE)
-  {
-    Serial.print(" (");
-    Serial.print(COAST_OUTPUT_KSXT ? "KSXT" : "PANDA q6");
-    Serial.print(", max ");
-    Serial.print(COAST_MAX_S);
-    Serial.print(" s / ");
-    Serial.print(COAST_MAX_M);
-    Serial.print(" m)");
-  }
-  Serial.print(", USB log ");
-  Serial.print(COAST_LOG_USB ? "ON" : "OFF");
-  Serial.print(", L=");
-  Serial.print(COAST_WHEELBASE_M);
-  Serial.print(" a=");
-  Serial.print(COAST_ANTENNA_FWD_M);
-  Serial.print(" h=");
-  Serial.print(COAST_ANTENNA_HEIGHT_M);
-  Serial.print(" m, observer ");
-  Serial.print(COAST_SPEED_OBSERVER ? "ON" : "OFF");
-  Serial.print(", crab ");
-  Serial.print(COAST_CRAB_MODEL ? "ON" : "OFF");
-  Serial.print(", speed pulse ");
-  if (COAST_SPEED_PULSE_PIN >= 0) { Serial.print("pin "); Serial.print(COAST_SPEED_PULSE_PIN); Serial.print(" @ "); Serial.print(COAST_PULSES_PER_M); Serial.print(" p/m"); }
-  else Serial.print("none");
-  Serial.println();
+  char msg[200];
+  snprintf(msg, sizeof(msg), "$COASTMSG,build: shadow %s, live %s (%s, max %.0f s / %.0f m), log %s, udp log port %d, "
+           "L=%.2f a=%.2f h=%.2f offs=%.2f, observer %s, crab %s, speed pulse %s",
+           COAST_SHADOW_MODE ? "ON" : "OFF", COAST_LIVE_ENABLE ? "ON" : "OFF",
+           COAST_OUTPUT_KSXT ? "KSXT" : "PANDA q6", (double)COAST_MAX_S, (double)COAST_MAX_M,
+           COAST_LOG ? "ON" : "OFF", (int)COAST_UDP_LOG_PORT,
+           (double)COAST_WHEELBASE_M, (double)COAST_ANTENNA_FWD_M, (double)COAST_ANTENNA_HEIGHT_M, (double)COAST_ANTENNA_OFFSET_M,
+           COAST_SPEED_OBSERVER ? "ON" : "OFF", COAST_CRAB_MODEL ? "ON" : "OFF",
+           COAST_SPEED_PULSE_PIN >= 0 ? "pin " STR(COAST_SPEED_PULSE_PIN) : "none");
+  coastSendText(msg);
 }
 
 bool coastLive()
@@ -195,21 +273,6 @@ void coastOnWas(float steerDeg)
   coast_was(&coastState, steerDeg);
 }
 
-// "!AOGCO,<seconds>" on USB
-void coastForce(int seconds)
-{
-  if (!coastInitDone) coastInit();
-  if (!COAST_LIVE_ENABLE)
-  {
-    Serial.println("$COASTMSG,forced coast ignored: COAST_LIVE_ENABLE is false");
-    return;
-  }
-  coast_force(&coastState, millis(), (float)seconds);
-  Serial.print("$COASTMSG,forced coast for ");
-  Serial.print(seconds);
-  Serial.println(" s");
-}
-
 // ----------------------------------------------------------------------------- output sentences
 static void coastNmeaChecksum(char *s)
 {
@@ -220,7 +283,7 @@ static void coastNmeaChecksum(char *s)
   strcat(s, tail);
 }
 
-static void coastSend(const char *s)
+static void coastSendSentence(const char *s)
 {
   if (!passThroughGPS && !passThroughGPS2) SerialAOG.print(s);
   if (Ethernet_running)
@@ -325,10 +388,11 @@ static void coastEmit(bool q0)
   }
   char s[200];
   if (COAST_OUTPUT_KSXT) coastBuildKsxt(s, q0); else coastBuildPanda(s, q0);
-  coastSend(s);
+  coastSendSentence(s);
   coastLastEmitMs = millis();
 }
 
+// ----------------------------------------------------------------------------- loop
 // Called from loop() every iteration.
 void coastLoop()
 {
@@ -361,19 +425,38 @@ void coastLoop()
 
   coast_tick(&coastState, micros());
 
+  // coast started
+  if (coastState.live && !coastWasLive)
+  {
+    char msg[80];
+    snprintf(msg, sizeof(msg), "COAST: %s, dead reckoning from last RTK fix", coastState.live_forced ? "forced test" : "GNSS lost");
+    coastSendDisplay(msg, 4, !coastState.live_forced);
+    coastSendText(coastState.live_forced ? "$COASTMSG,live coast started (forced)" : "$COASTMSG,live coast started (GNSS lost)");
+  }
+  coastWasLive = coastState.live;
+
   if (coastState.live_report_ready)
   {
     coast_live_report_t *r = &coastState.live_report;
-    Serial.print("$COASTREPORT,");
-    Serial.print(r->reason);                    Serial.print(",");
-    Serial.print(r->duration_ms / 1000.0f, 1);  Serial.print(",");
-    Serial.print(r->dist_m, 1);                 Serial.print(",");
-    if (r->has_error) { Serial.print(r->along_m, 2); Serial.print(","); Serial.print(r->cross_m, 2); }
-    else Serial.print(",");
-    Serial.print(",");
-    Serial.print(r->v_start_mps, 2);            Serial.print(",");
-    Serial.print(r->forced ? 1 : 0);            Serial.print(",");
-    Serial.println(r->used_fallback ? 1 : 0);
+    char msg[160];
+    if (r->has_error)
+      snprintf(msg, sizeof(msg), "$COASTREPORT,%d,%.1f,%.1f,%.2f,%.2f,%.2f,%d,%d",
+               r->reason, r->duration_ms / 1000.0f, r->dist_m, r->along_m, r->cross_m, r->v_start_mps,
+               r->forced ? 1 : 0, r->used_fallback ? 1 : 0);
+    else
+      snprintf(msg, sizeof(msg), "$COASTREPORT,%d,%.1f,%.1f,,,%.2f,%d,%d",
+               r->reason, r->duration_ms / 1000.0f, r->dist_m, r->v_start_mps,
+               r->forced ? 1 : 0, r->used_fallback ? 1 : 0);
+    coastSendText(msg);
+
+    const char *why = r->reason == COAST_END_RECOVERED ? "RTK back" : r->reason == COAST_END_TIMEOUT ? "TIMED OUT" : "SENSOR LOST";
+    if (r->has_error)
+      snprintf(msg, sizeof(msg), "Coast %s after %.1f s / %.0f m: error along %.2f cross %.2f m%s",
+               why, r->duration_ms / 1000.0f, r->dist_m, r->along_m, r->cross_m, r->used_fallback ? " (wheel model)" : "");
+    else
+      snprintf(msg, sizeof(msg), "Coast %s after %.1f s / %.0f m%s",
+               why, r->duration_ms / 1000.0f, r->dist_m, r->used_fallback ? " (wheel model)" : "");
+    coastSendDisplay(msg, 12, r->reason != COAST_END_RECOVERED);
     coastState.live_report_ready = false;
   }
 
@@ -389,6 +472,7 @@ void coastLoop()
   }
 }
 
+// ----------------------------------------------------------------------------- GNSS event
 // Called from KSXT_Handler with the parsed fields. Speed already in m/s.
 // Returns true if the raw KSXT sentence should still be forwarded to AgIO.
 bool coastOnKSXT(uint32_t t_ms, double lat, double lon, float alt, int posQ, int hdgQ,
@@ -408,52 +492,36 @@ bool coastOnKSXT(uint32_t t_ms, double lat, double lon, float alt, int posQ, int
   if (coastState.report_ready)
   {
     coast_report_t *r = &coastState.report;
-    Serial.print("$COASTSHADOW,");
-    Serial.print(r->duration_ms / 1000.0f, 1);  Serial.print(",");
-    Serial.print(r->dist_m, 1);                 Serial.print(",");
-    Serial.print(r->along_m, 2);                Serial.print(",");
-    Serial.print(r->cross_m, 2);                Serial.print(",");
-    Serial.print(r->max_abs_along_m, 2);        Serial.print(",");
-    Serial.print(r->max_abs_cross_m, 2);        Serial.print(",");
-    Serial.print(r->delta_deg, 2);              Serial.print(",");
-    Serial.print(r->offset_deg);                Serial.print(",");
-    Serial.print(r->beta_deg, 2);               Serial.print(",");
-    Serial.print(r->v_start_mps, 2);            Serial.print(",");
-    Serial.print(r->v_end_mps, 2);              Serial.print(",");
-    Serial.print(r->fix_count);                 Serial.print(",");
-    Serial.print(r->leff_m, 3);                 Serial.print(",");
-    Serial.print(r->k_crab, 2);                 Serial.print(",");
-    Serial.print(r->was_sign, 0);               Serial.print(",");
-    Serial.print(r->observer_frac, 2);          Serial.print(",");
-    Serial.print(r->ext_frac, 2);               Serial.print(",");
-    Serial.println(r->ext_scale, 4);
+    char msg[220];
+    snprintf(msg, sizeof(msg), "$COASTSHADOW,%.1f,%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%.2f,%.2f,%.2f,%lu,%.3f,%.2f,%.0f,%.2f,%.2f,%.4f",
+             r->duration_ms / 1000.0f, r->dist_m, r->along_m, r->cross_m, r->max_abs_along_m, r->max_abs_cross_m,
+             r->delta_deg, r->offset_deg, r->beta_deg, r->v_start_mps, r->v_end_mps, (unsigned long)r->fix_count,
+             r->leff_m, r->k_crab, r->was_sign, r->observer_frac, r->ext_frac, r->ext_scale);
+    coastSendText(msg);
+    if (COAST_DISPLAY_SHADOW)
+    {
+      snprintf(msg, sizeof(msg), "Shadow %.0fs/%.0fm: cross %.2f along %.2f (max %.2f/%.2f) L%.2f k%.1f s%.2f",
+               r->duration_ms / 1000.0f, r->dist_m, r->cross_m, r->along_m, r->max_abs_cross_m, r->max_abs_along_m,
+               r->leff_m, r->k_crab, r->ext_scale);
+      coastSendDisplay(msg, 8, false);
+    }
     coastState.report_ready = false;
   }
 
-  if (COAST_LOG_USB)
+  if (COAST_LOG)
   {
-    Serial.print("$COAST,");
-    Serial.print(t_ms);                      Serial.print(",");
-    Serial.print(lat, 8);                    Serial.print(",");
-    Serial.print(lon, 8);                    Serial.print(",");
-    Serial.print(posQ);                      Serial.print(",");
-    Serial.print(hdgQ);                      Serial.print(",");
-    Serial.print(hdgRaw, 2);                 Serial.print(",");
-    Serial.print(track, 2);                  Serial.print(",");
-    Serial.print(vMps, 3);                   Serial.print(",");
-    Serial.print(dualRoll, 2);               Serial.print(",");
-    Serial.print(coastState.yaw_deg, 3);     Serial.print(",");
-    Serial.print(coastState.roll_deg, 2);    Serial.print(",");
-    Serial.print(coastState.pitch_deg, 2);   Serial.print(",");
-    Serial.print(coastState.was_deg, 2);     Serial.print(",");
-    Serial.print(coastState.delta_valid ? coastState.delta_deg : 999.0f, 2); Serial.print(",");
-    Serial.print(coastState.quad_valid ? coastState.quad_offset_deg : 999);  Serial.print(",");
-    Serial.print(coastState.live ? 2 : (coastState.active ? 1 : 0)); Serial.print(",");
-    Serial.print(coastState.along_m, 3);     Serial.print(",");
-    Serial.print(coastState.cross_m, 3);     Serial.print(",");
-    Serial.print(coastState.leff_valid ? coastState.leff_m : 0.0f, 3); Serial.print(",");
-    Serial.print(coastState.k_valid ? coastState.k_crab : 0.0f, 2);    Serial.print(",");
-    Serial.println(coastState.ext_valid ? coastState.ext_v_raw_mps : -1.0f, 3);
+    char msg[240];
+    snprintf(msg, sizeof(msg), "$COAST,%lu,%.8f,%.8f,%d,%d,%.2f,%.2f,%.3f,%.2f,%.3f,%.2f,%.2f,%.2f,%.2f,%d,%d,%.3f,%.3f,%.3f,%.2f,%.3f",
+             (unsigned long)t_ms, lat, lon, posQ, hdgQ, hdgRaw, track, vMps, dualRoll,
+             coastState.yaw_deg, coastState.roll_deg, coastState.pitch_deg, coastState.was_deg,
+             coastState.delta_valid ? coastState.delta_deg : 999.0f,
+             coastState.quad_valid ? coastState.quad_offset_deg : 999,
+             coastState.live ? 2 : (coastState.active ? 1 : 0),
+             coastState.along_m, coastState.cross_m,
+             coastState.leff_valid ? coastState.leff_m : 0.0f,
+             coastState.k_valid ? coastState.k_crab : 0.0f,
+             coastState.ext_valid ? coastState.ext_v_raw_mps : -1.0f);
+    coastSendText(msg);
   }
 
   return !coastState.live;

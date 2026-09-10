@@ -185,6 +185,20 @@ The geometry no longer has to be compiled in. Precedence: compile-time defaults 
 
 Both print `$COASTMSG,geometry applied …` and store the value in EEPROM (only when it changed). A change that arrives during a live coast is applied when that coast ends. Changing the wheelbase restarts the `L_eff` learning; any change restarts the crab, slip and pulse-scale learning, since the antenna geometry enters all of them.
 
+### 10b. Diagnostics and commands without a USB cable
+
+The AiO's enclosure does not expose USB, so everything also runs over the Ethernet link AgIO already uses:
+
+| Channel | Carries | Where it shows |
+|---|---|---|
+| AgOpenGPS hardware message (PGN 221) | coast start, `$COASTREPORT` summary, each shadow window (`COAST_DISPLAY_SHADOW`), geometry changes | on the AgOpenGPS screen (tick **Hardware Messages** in the display settings) and in `Documents/AgOpenGPS/Logs/AgOpenGPS_Events_Log.txt` |
+| UDP broadcast on `COAST_UDP_LOG_PORT` (5125) | every diagnostic line, including the 10 Hz `$COAST` log when `COAST_LOG` is on | `tests/coast/coast_monitor.py` on any laptop on the tractor subnet |
+| AgOpenGPS PGN 210 (0xD2) | commands to the module; the **Coast 10 s test** button in the steer settings form sends cmd 1 | — |
+| UDP text to the module's port 8888 | `!AOGCO,<s>` and `!AOGCG,L,pivot,height,offset` as plain text | `coast_monitor.py --module <ip> --force 10` |
+| USB serial | all of the above, when a cable is available | serial monitor |
+
+Alarm-coloured messages (salmon) are used for a real GNSS loss, a timeout, a sensor loss or a rejected geometry; a forced test and normal reports are bisque.
+
 ## 11. Shadow mode and validation
 
 **Shadow mode** is the key tool. The coast estimator runs continuously while GNSS is good, restarting every 20 s from the current fix and integrating in the background. Every 100 ms it compares itself with the live fix; at the end of each window it prints max along-track and cross-track error. This measures coast accuracy on every drive, on every field, with no GPS loss and no risk. Turn it on first, drive the sloped curves in the open, read the numbers. Only then enable output.

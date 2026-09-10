@@ -561,7 +561,12 @@ void ReceiveUdp()
 	{
 		Eth_udpAutoSteer.read(autoSteerUdpData, UDP_TX_PACKET_MAX_SIZE);
 
-		if (autoSteerUdpData[0] == 0x80 && autoSteerUdpData[1] == 0x81 && autoSteerUdpData[2] == 0x7F) //Data
+		// "!AOGCO,10" / "!AOGCG,..." as plain text on this port: coast commands without a USB cable
+		if (autoSteerUdpData[0] == '!' && autoSteerUdpData[1] == 'A' && autoSteerUdpData[2] == 'O' && autoSteerUdpData[3] == 'G')
+		{
+			coastUdpCommand(autoSteerUdpData, len);
+		}
+		else if (autoSteerUdpData[0] == 0x80 && autoSteerUdpData[1] == 0x81 && autoSteerUdpData[2] == 0x7F) //Data
 		{
 			if (autoSteerUdpData[3] == 0xFE && Autosteer_running)  //254
 			{
@@ -736,6 +741,15 @@ void ReceiveUdp()
 					float h = (float)(uint16_t)(autoSteerUdpData[9] | (autoSteerUdpData[10] << 8)) * 0.01f;
 					float o = (float)(int16_t)(autoSteerUdpData[11] | (autoSteerUdpData[12] << 8)) * 0.01f;
 					coastApplyGeometry(L, a, h, o, "AgOpenGPS PGN 209", true);
+				}
+			}
+
+			// 210 (0xD2) - coast command from AgOpenGPS: byte 5 cmd (1 = forced coast), bytes 6-7 value (seconds)
+			else if (autoSteerUdpData[3] == 0xD2)
+			{
+				if (autoSteerUdpData[4] >= 3)
+				{
+					coastOnPgn210(autoSteerUdpData[5], (uint16_t)(autoSteerUdpData[6] | (autoSteerUdpData[7] << 8)));
 				}
 			}
 			else if (autoSteerUdpData[3] == 200) // Hello from AgIO
