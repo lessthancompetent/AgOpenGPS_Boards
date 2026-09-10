@@ -1,4 +1,4 @@
-// Dead-reckoning coast core (Phase 0 + Phase 2). See zCoastCore.h and the design doc.
+// Dead-reckoning coast core. See zCoastCore.h and the design doc.
 #include "zCoastCore.h"
 #include <math.h>
 #include <string.h>
@@ -28,6 +28,15 @@
 #define EXT_TIMEOUT_MS       300u
 #define EXT_SCALE_TAU_S      30.0f
 #define EXT_SCALE_MIN_SAMPLES 50
+
+// Live coast
+#define LIVE_SILENCE_MS      250     // no KSXT for this long counts as a loss
+#define LIVE_MAX_FIX_AGE_MS  1000    // last RTK fix must be at most this old to start
+#define LIVE_MAX_IMU_AGE_MS  100     // TM171 must be at least this fresh to start
+#define LIVE_IMU_STALE_US    200000  // switch heading to the wheel model after this
+#define LIVE_RECOVER_FIXES   2       // consecutive RTK fixes to end the coast
+#define LIVE_HDOP_BASE       0.5f
+#define LIVE_HDOP_PER_S      0.05f
 
 float coast_wrap180(float a)
 {
@@ -59,6 +68,8 @@ void coast_init(coast_t *c, const coast_config_t *cfg)
   if (c->cfg.imu_roll_sign == 0.0f) c->cfg.imu_roll_sign = 1.0f;
   if (c->cfg.shadow_window_s <= 0.0f) c->cfg.shadow_window_s = 20.0f;
   if (c->cfg.min_speed_mps <= 0.0f) c->cfg.min_speed_mps = 0.5f;
+  if (c->cfg.live_max_s <= 0.0f) c->cfg.live_max_s = 20.0f;
+  if (c->cfg.live_max_m <= 0.0f) c->cfg.live_max_m = 60.0f;
   if (c->cfg.dual_heading_offset_deg != COAST_AUTO_OFFSET)
   {
     c->quad_offset_deg = (int)lroundf(c->cfg.dual_heading_offset_deg);
@@ -74,6 +85,10 @@ float coast_vehicle_heading(const coast_t *c, float hdg_raw_deg)
   return coast_wrap360(hdg_raw_deg + (float)c->quad_offset_deg);
 }
 
+// ----------------------------------------------------------------------------- helpers
+static float imu_roll(const coast_t *c) { return c->cfg.imu_roll_sign * c->roll_deg; }
+static float imu_yaw(const coast_t *c)  { return c->cfg.imu_yaw_sign * c->yaw_deg; }
+
 // Rear axle offset from the antenna, in the current heading/roll: axle = antenna - a*fwd - h*sin(roll)*right
 static void axle_from_antenna(const coast_t *c, float psi_deg, float roll_deg, double *dn, double *de)
 {
@@ -84,19 +99,110 @@ static void axle_from_antenna(const coast_t *c, float psi_deg, float roll_deg, d
   *dn = -a * co + hr * s;
 }
 
-static float imu_roll(const coast_t *c) { return c->cfg.imu_roll_sign * c->roll_deg; }
-static float imu_yaw(const coast_t *c)  { return c->cfg.imu_yaw_sign * c->yaw_deg; }
-static float antenna_lateral_mps(const coast_t *c);
-static float axle_speed(const coast_t *c, float v_antenna_mps);
-static bool  ext_speed_fresh(const coast_t *c, uint32_t now_ms);
-static float ext_speed_h(const coast_t *c);
-
 static bool turning(const coast_t *c, float *delta_deg)
 {
   if (!c->was_valid || !c->was_sign_valid) return false;
   float d = c->was_sign * c->was_deg;
   *delta_deg = d;
   return fabsf(d) > TURN_MIN_WAS_DEG && fabsf(c->yaw_rate_dps) > TURN_MIN_RATE_DPS;
+}
+
+// Antenna velocity relative to the axle, in the vehicle frame (ignoring slip):
+//   along = v_axle - hr*yawrate,  lateral = a*yawrate + h*cos(roll)*rollrate,  hr = h*sin(roll)
+// The KSXT speed is the antenna's, so the axle speed is recovered from it, and the geometric
+// part of (track - heading) is removed before anything is called "slip".
+static float antenna_lateral_mps(const coast_t *c)
+{
+  float rollc = imu_roll(c) * (float)DEG2RAD;
+  return c->cfg.antenna_fwd_m * c->yaw_rate_dps * (float)DEG2RAD
+       + c->cfg.antenna_height_m * cosf(rollc) * c->roll_rate_dps * (float)DEG2RAD;
+}
+
+static float axle_speed(const coast_t *c, float v_antenna_mps)
+{
+  float hr = c->cfg.antenna_height_m * sinf(imu_roll(c) * (float)DEG2RAD);
+  float lat = antenna_lateral_mps(c);
+  float along2 = v_antenna_mps * v_antenna_mps - lat * lat;
+  float along = along2 > 0.0f ? sqrtf(along2) : 0.0f;
+  float v = along + hr * c->yaw_rate_dps * (float)DEG2RAD;
+  return v > 0.0f ? v : 0.0f;
+}
+
+// Slip crab of the axle: (track - vehicle heading) minus the geometric crab of the antenna
+static float slip_crab(const coast_t *c, const coast_fix_t *fix)
+{
+  float veh = coast_vehicle_heading(c, fix->hdg_raw_deg);
+  float beta_total = coast_wrap180(fix->track_deg - veh);
+  float hr = c->cfg.antenna_height_m * sinf(imu_roll(c) * (float)DEG2RAD);
+  float along = axle_speed(c, fix->v_mps) - hr * c->yaw_rate_dps * (float)DEG2RAD;
+  float beta_kin = (float)(atan2((double)antenna_lateral_mps(c), (double)along) * RAD2DEG);
+  return coast_wrap180(beta_total - beta_kin);
+}
+
+// External speed, scaled and projected to the horizontal: the pulse counts distance along the slope.
+static bool ext_speed_fresh(const coast_t *c, uint32_t now_ms)
+{
+  return c->cfg.ext_speed && c->ext_valid && (int32_t)(now_ms - c->ext_t_ms) <= (int32_t)EXT_TIMEOUT_MS;
+}
+
+static float ext_speed_h(const coast_t *c)
+{
+  float s = c->ext_scale_valid ? c->ext_scale : 1.0f;
+  return c->ext_v_raw_mps * s * cosf(c->pitch_deg * (float)DEG2RAD);
+}
+
+// ----------------------------------------------------------------------------- inputs
+void coast_was(coast_t *c, float steer_deg)
+{
+  c->was_deg = steer_deg; c->was_valid = true;
+}
+
+void coast_ext_speed(coast_t *c, uint32_t t_ms, float v_raw_mps)
+{
+  c->ext_v_raw_mps = v_raw_mps < 0.0f ? 0.0f : v_raw_mps;
+  c->ext_t_ms = t_ms; c->ext_valid = true;
+}
+
+// One integration step with a given heading. Used by the IMU path and by the wheel-model fallback.
+static void integrate(coast_t *c, float dt, float psi_deg, float roll_c, uint32_t now_ms)
+{
+  c->psi_deg = psi_deg;
+
+  // crab: k*sin(roll_now) + residual (which decays toward the model), or the frozen entry value
+  if (c->cfg.crab_model && c->k_valid)
+  {
+    c->beta_res_deg -= c->beta_res_deg * (dt / (RES_TAU_S + dt));
+    c->beta_deg = c->k_crab * sinf(roll_c * (float)DEG2RAD) + c->beta_res_deg;
+  }
+  else
+    c->beta_deg = c->beta_res_deg;
+
+  // speed: external pulse when fresh, else observer on turns, else hold
+  float d;
+  if (ext_speed_fresh(c, now_ms))
+  {
+    c->v_mps = ext_speed_h(c);
+    c->ext_samples++;
+  }
+  else if (c->cfg.speed_observer && c->leff_valid && turning(c, &d))
+  {
+    float v_obs = fabsf(c->yaw_rate_dps * (float)DEG2RAD * c->leff_m / tanf(d * (float)DEG2RAD));
+    float a_obs = dt / (dt + OBS_TAU_S);
+    float dv = (v_obs - c->v_mps) * a_obs;
+    float lim = OBS_MAX_ACCEL_MPS2 * dt;
+    if (dv > lim) dv = lim; else if (dv < -lim) dv = -lim;
+    c->v_mps += dv;
+    if (c->v_mps < 0.0f) c->v_mps = 0.0f;
+    if (c->v_mps > OBS_MAX_SPEED_RATIO * c->v_start_mps) c->v_mps = OBS_MAX_SPEED_RATIO * c->v_start_mps;
+    c->obs_samples++;
+  }
+  c->int_samples++;
+
+  float chi = (c->psi_deg + c->beta_deg) * (float)DEG2RAD;
+  c->n_m += (double)(c->v_mps * cosf(chi) * dt);
+  c->e_m += (double)(c->v_mps * sinf(chi) * dt);
+  c->dist_m += c->v_mps * dt;
+  c->alt_m += c->v_mps * sinf(c->pitch_deg * (float)DEG2RAD) * dt;
 }
 
 void coast_imu(coast_t *c, uint32_t t_us, float yaw_deg, float roll_deg, float pitch_deg)
@@ -112,78 +218,22 @@ void coast_imu(coast_t *c, uint32_t t_us, float yaw_deg, float roll_deg, float p
       float rrate = c->cfg.imu_roll_sign * (roll_deg - c->roll_deg) / dt;
       c->roll_rate_dps += (rrate - c->roll_rate_dps) * alpha;
 
+      c->yaw_deg = yaw_deg; c->roll_deg = roll_deg; c->pitch_deg = pitch_deg;
       if (c->active)
       {
-        c->psi_deg = coast_wrap360(c->cfg.imu_yaw_sign * yaw_deg + c->delta_frozen_deg);
-
-        // crab: k*sin(roll_now) + residual (which decays toward the model), or the frozen entry value
-        float rollc = c->cfg.imu_roll_sign * roll_deg;
-        if (c->cfg.crab_model && c->k_valid)
-        {
-          c->beta_res_deg -= c->beta_res_deg * (dt / (RES_TAU_S + dt));
-          c->beta_deg = c->k_crab * sinf(rollc * (float)DEG2RAD) + c->beta_res_deg;
-        }
-        else
-          c->beta_deg = c->beta_res_deg;
-
-        // speed: external pulse when fresh, else observer on turns, else hold
-        float d;
-        if (ext_speed_fresh(c, t_us / 1000u))
-        {
-          c->v_mps = ext_speed_h(c);
-          c->ext_samples++;
-        }
-        else if (c->cfg.speed_observer && c->leff_valid && turning(c, &d))
-        {
-          float v_obs = fabsf(c->yaw_rate_dps * (float)DEG2RAD * c->leff_m / tanf(d * (float)DEG2RAD));
-          float a_obs = dt / (dt + OBS_TAU_S);
-          float dv = (v_obs - c->v_mps) * a_obs;
-          float lim = OBS_MAX_ACCEL_MPS2 * dt;
-          if (dv > lim) dv = lim; else if (dv < -lim) dv = -lim;
-          c->v_mps += dv;
-          if (c->v_mps < 0.0f) c->v_mps = 0.0f;
-          if (c->v_mps > OBS_MAX_SPEED_RATIO * c->v_start_mps) c->v_mps = OBS_MAX_SPEED_RATIO * c->v_start_mps;
-          c->obs_samples++;
-        }
-        c->int_samples++;
-
-        float chi = (c->psi_deg + c->beta_deg) * (float)DEG2RAD;
-        c->n_m += (double)(c->v_mps * cosf(chi) * dt);
-        c->e_m += (double)(c->v_mps * sinf(chi) * dt);
-        c->dist_m += c->v_mps * dt;
+        integrate(c, dt, coast_wrap360(c->cfg.imu_yaw_sign * yaw_deg + c->delta_frozen_deg),
+                  c->cfg.imu_roll_sign * roll_deg, t_us / 1000u);
         c->t_last_us = t_us;
+        c->imu_fallback = false;
       }
     }
-    else if (dt >= 0.5f && c->active)
+    else if (dt >= 0.5f && c->active && !c->live)
     {
-      c->active = false;   // IMU gap: abandon the window silently
+      c->active = false;   // IMU gap in a shadow window: abandon it silently (a live coast is handled by coast_tick)
     }
   }
   c->yaw_deg = yaw_deg; c->roll_deg = roll_deg; c->pitch_deg = pitch_deg;
   c->imu_t_us = t_us; c->imu_valid = true;
-}
-
-void coast_was(coast_t *c, float steer_deg)
-{
-  c->was_deg = steer_deg; c->was_valid = true;
-}
-
-void coast_ext_speed(coast_t *c, uint32_t t_ms, float v_raw_mps)
-{
-  c->ext_v_raw_mps = v_raw_mps < 0.0f ? 0.0f : v_raw_mps;
-  c->ext_t_ms = t_ms; c->ext_valid = true;
-}
-
-// External speed, scaled and projected to the horizontal: the pulse counts distance along the slope.
-static bool ext_speed_fresh(const coast_t *c, uint32_t now_ms)
-{
-  return c->cfg.ext_speed && c->ext_valid && (int32_t)(now_ms - c->ext_t_ms) <= (int32_t)EXT_TIMEOUT_MS;
-}
-
-static float ext_speed_h(const coast_t *c)
-{
-  float s = c->ext_scale_valid ? c->ext_scale : 1.0f;
-  return c->ext_v_raw_mps * s * cosf(c->pitch_deg * (float)DEG2RAD);
 }
 
 bool coast_predict_antenna(const coast_t *c, double *lat_deg, double *lon_deg)
@@ -199,6 +249,7 @@ bool coast_predict_antenna(const coast_t *c, double *lat_deg, double *lon_deg)
   return true;
 }
 
+// ----------------------------------------------------------------------------- learning
 static void learn_quadrant(coast_t *c, const coast_fix_t *fix)
 {
   if (c->cfg.dual_heading_offset_deg != COAST_AUTO_OFFSET) return;
@@ -282,38 +333,6 @@ static void learn_wheelbase(coast_t *c, const coast_fix_t *fix)
   if (c->leff_n >= LEFF_MIN_SAMPLES) c->leff_valid = true;
 }
 
-// Antenna velocity relative to the axle, in the vehicle frame (ignoring slip):
-//   along = v_axle - hr*yawrate,  lateral = a*yawrate + h*cos(roll)*rollrate,  hr = h*sin(roll)
-// The KSXT speed is the antenna's, so the axle speed is recovered from it, and the geometric
-// part of (track - heading) is removed before anything is called "slip".
-static float antenna_lateral_mps(const coast_t *c)
-{
-  float rollc = imu_roll(c) * (float)DEG2RAD;
-  return c->cfg.antenna_fwd_m * c->yaw_rate_dps * (float)DEG2RAD
-       + c->cfg.antenna_height_m * cosf(rollc) * c->roll_rate_dps * (float)DEG2RAD;
-}
-
-static float axle_speed(const coast_t *c, float v_antenna_mps)
-{
-  float hr = c->cfg.antenna_height_m * sinf(imu_roll(c) * (float)DEG2RAD);
-  float lat = antenna_lateral_mps(c);
-  float along2 = v_antenna_mps * v_antenna_mps - lat * lat;
-  float along = along2 > 0.0f ? sqrtf(along2) : 0.0f;
-  float v = along + hr * c->yaw_rate_dps * (float)DEG2RAD;
-  return v > 0.0f ? v : 0.0f;
-}
-
-// Slip crab of the axle: (track - vehicle heading) minus the geometric crab of the antenna
-static float slip_crab(const coast_t *c, const coast_fix_t *fix)
-{
-  float veh = coast_vehicle_heading(c, fix->hdg_raw_deg);
-  float beta_total = coast_wrap180(fix->track_deg - veh);
-  float hr = c->cfg.antenna_height_m * sinf(imu_roll(c) * (float)DEG2RAD);
-  float along = axle_speed(c, fix->v_mps) - hr * c->yaw_rate_dps * (float)DEG2RAD;
-  float beta_kin = (float)(atan2((double)antenna_lateral_mps(c), (double)along) * RAD2DEG);
-  return coast_wrap180(beta_total - beta_kin);
-}
-
 // External speed scale: GNSS axle speed / raw pulse speed, 30 s LPF. Absorbs tyre radius, radar
 // mounting angle and a wrong pulses-per-metre constant.
 static void learn_ext_scale(coast_t *c, const coast_fix_t *fix)
@@ -386,6 +405,7 @@ static void learn_crab(coast_t *c, const coast_fix_t *fix)
   if (c->k_n >= K_MIN_SAMPLES) c->k_valid = true;
 }
 
+// ----------------------------------------------------------------------------- integrator windows
 static void start_window(coast_t *c, const coast_fix_t *fix)
 {
   c->delta_frozen_deg = c->delta_deg;
@@ -401,6 +421,7 @@ static void start_window(coast_t *c, const coast_fix_t *fix)
   c->beta_deg = c->beta_entry_deg;
 
   c->lat0_deg = fix->lat_deg; c->lon0_deg = fix->lon_deg;
+  c->alt_m = fix->alt_m;
   coast_earth_radii(c->lat0_deg, &c->rm_m, &c->rn_m);
   axle_from_antenna(c, c->psi_deg, imu_roll(c), &c->n_m, &c->e_m);
 
@@ -412,6 +433,7 @@ static void start_window(coast_t *c, const coast_fix_t *fix)
   c->fix_count = 0;
   c->int_samples = c->obs_samples = c->ext_samples = 0;
   c->active = true;
+  c->live = false;
 }
 
 static void compare_fix(coast_t *c, const coast_fix_t *fix)
@@ -450,33 +472,185 @@ static void finish_window(coast_t *c, const coast_fix_t *fix)
   c->active = false;
 }
 
+// ----------------------------------------------------------------------------- live coast
+static void end_live(coast_t *c, uint32_t now_ms, int reason)
+{
+  coast_live_report_t *r = &c->live_report;
+  r->reason = reason;
+  r->duration_ms = now_ms - c->t_start_ms;
+  r->dist_m = c->dist_m;
+  r->has_error = c->fix_count > 0;
+  r->along_m = c->along_m; r->cross_m = c->cross_m;
+  r->v_start_mps = c->v_start_mps;
+  r->forced = c->live_forced;
+  r->used_fallback = c->live_used_fallback;
+  c->live_report_ready = true;
+  c->q0_pending = (reason == COAST_END_TIMEOUT || reason == COAST_END_SENSOR);
+  c->live = false;
+  c->active = false;
+  c->imu_fallback = false;
+}
+
+// Start a live coast from the last RTK fix, if everything needed is fresh.
+static void try_start_live(coast_t *c, uint32_t now_ms)
+{
+  if (!c->cfg.live_enable || c->live) return;
+  if (!c->last_valid || (int32_t)(now_ms - c->last.t_ms) > LIVE_MAX_FIX_AGE_MS) return;
+  if (!c->imu_valid || (int32_t)(now_ms - c->imu_t_us / 1000u) > LIVE_MAX_IMU_AGE_MS) return;
+  if (!c->delta_valid || !c->quad_valid) return;
+
+  start_window(c, &c->last);          // origin = last RTK fix, heading from the IMU now
+  c->live = true;
+  c->live_good = 0;
+  c->live_forced = c->forced;
+  c->live_used_fallback = false;
+  c->imu_fallback = false;
+  c->roll_at_loss_deg = c->roll_deg;
+  c->dual_roll_at_loss_deg = c->last.dual_roll_deg;
+  c->tick_t_us = c->imu_t_us; c->tick_valid = true;
+
+  // motion since that fix (up to LIVE_MAX_FIX_AGE_MS): straight at the current heading
+  float gap = (float)(int32_t)(now_ms - c->last.t_ms) * 1e-3f;
+  if (gap > 0.0f) integrate(c, gap, c->psi_deg, imu_roll(c), now_ms);
+}
+
+void coast_force(coast_t *c, uint32_t now_ms, float seconds)
+{
+  if (seconds <= 0.0f) { c->forced = false; return; }
+  c->forced = true;
+  c->force_until_ms = now_ms + (uint32_t)(seconds * 1000.0f);
+}
+
+void coast_tick(coast_t *c, uint32_t t_us)
+{
+  uint32_t now_ms = t_us / 1000u;
+
+  // receiver gone quiet: treat as a loss
+  if (c->cfg.live_enable && c->last_any_valid && !c->gnss_lost &&
+      (int32_t)(now_ms - c->last_any_ms) > LIVE_SILENCE_MS)
+  {
+    c->gnss_lost = true;
+    if (!c->live) try_start_live(c, now_ms);
+  }
+
+  if (c->live)
+  {
+    // IMU stale: carry the heading with the wheel model, integrate on the tick
+    if ((int32_t)(t_us - c->imu_t_us) > LIVE_IMU_STALE_US)
+    {
+      if (!c->was_valid || !c->was_sign_valid)
+      {
+        end_live(c, now_ms, COAST_END_SENSOR);
+      }
+      else if (c->tick_valid)
+      {
+        float dt = (float)(t_us - c->tick_t_us) * 1e-6f;
+        if (dt > 0.0f && dt < 0.5f)
+        {
+          float L = c->leff_valid ? c->leff_m : c->cfg.wheelbase_m;
+          float d = c->was_sign * c->was_deg;
+          float rate_dps = c->v_mps * tanf(d * (float)DEG2RAD) / L * (float)RAD2DEG;
+          c->yaw_rate_dps = rate_dps;
+          integrate(c, dt, coast_wrap360(c->psi_deg + rate_dps * dt), imu_roll(c), now_ms);
+          c->imu_fallback = true;
+          c->live_used_fallback = true;
+        }
+      }
+    }
+    if (c->live && ((float)(int32_t)(now_ms - c->t_start_ms) * 1e-3f > c->cfg.live_max_s ||
+                    c->dist_m > c->cfg.live_max_m))
+    {
+      end_live(c, now_ms, COAST_END_TIMEOUT);
+    }
+  }
+  c->tick_t_us = t_us; c->tick_valid = true;
+}
+
+bool coast_live_output(const coast_t *c, uint32_t now_ms, coast_out_t *out)
+{
+  if (!c->live) return false;
+  if (!coast_predict_antenna(c, &out->lat_deg, &out->lon_deg)) return false;
+  out->alt_m = c->alt_m;
+  out->heading_deg = c->psi_deg;
+  out->track_deg = coast_wrap360(c->psi_deg + c->beta_deg);
+  out->roll_deg = c->roll_deg;
+  out->pitch_deg = c->pitch_deg;
+  out->v_mps = c->v_mps;
+  out->elapsed_ms = now_ms - c->t_start_ms;
+  out->hdop = LIVE_HDOP_BASE + LIVE_HDOP_PER_S * (float)out->elapsed_ms * 1e-3f;
+  out->dist_m = c->dist_m;
+  out->imu_fallback = c->imu_fallback;
+  return true;
+}
+
+// ----------------------------------------------------------------------------- GNSS event
 void coast_gnss(coast_t *c, const coast_fix_t *fix)
 {
+  c->last_any_ms = fix->t_ms; c->last_any_valid = true;
+
+  bool forced_now = c->forced && (int32_t)(c->force_until_ms - fix->t_ms) > 0;
+  if (c->forced && !forced_now) c->forced = false;
+  if (forced_now && !c->cfg.live_enable) { c->forced = false; forced_now = false; }
+
   bool good = (fix->pos_q == 3);
-  if (!good)
+  bool flt  = (fix->pos_q == 2) && !c->cfg.live_on_float;
+  bool lost = !good && !flt;
+
+  if (good && forced_now)
   {
-    // Phase 0/2: a real loss just interrupts the shadow window. Abandon it if the gap grows.
-    if (c->active && c->last_valid && (fix->t_ms - c->last.t_ms) > 1000) c->active = false;
-    return;
+    // field test: the fix is real, so measure against it, but behave as if it were lost
+    if (c->live) compare_fix(c, fix);
+    good = false; lost = true;
   }
 
-  learn_quadrant(c, fix);
-  learn_delta(c, fix);
-  learn_wheelbase(c, fix);
-  learn_ext_scale(c, fix);
-  update_slip(c, fix);
-  learn_crab(c, fix);
-
-  if (c->active)
+  if (good)
   {
-    compare_fix(c, fix);
-    if ((float)(fix->t_ms - c->t_start_ms) * 1e-3f >= c->cfg.shadow_window_s) finish_window(c, fix);
+    c->gnss_lost = false;
+    learn_quadrant(c, fix);
+    learn_delta(c, fix);
+    learn_wheelbase(c, fix);
+    learn_ext_scale(c, fix);
+    update_slip(c, fix);
+    learn_crab(c, fix);
+
+    if (c->live)
+    {
+      c->live_good++;
+      compare_fix(c, fix);
+      if (c->live_good >= LIVE_RECOVER_FIXES) end_live(c, fix->t_ms, COAST_END_RECOVERED);
+    }
+    else if (c->active)
+    {
+      compare_fix(c, fix);
+      if ((float)(fix->t_ms - c->t_start_ms) * 1e-3f >= c->cfg.shadow_window_s) finish_window(c, fix);
+    }
+
+    c->last = *fix; c->last_valid = true;
+
+    if (!c->active && !c->live && c->delta_valid && c->quad_valid && c->imu_valid &&
+        fix->v_mps >= c->cfg.min_speed_mps)
+    {
+      start_window(c, fix);
+    }
   }
-
-  c->last = *fix; c->last_valid = true;
-
-  if (!c->active && c->delta_valid && c->quad_valid && c->imu_valid && fix->v_mps >= c->cfg.min_speed_mps)
+  else if (flt)
   {
-    start_window(c, fix);
+    // float: position exists but is not good enough to start or end a coast
+    c->gnss_lost = false;
+    if (c->live) c->live_good = 0;
+    else if (c->active && c->last_valid && (fix->t_ms - c->last.t_ms) > 1000) c->active = false;
+  }
+  else if (lost)
+  {
+    c->gnss_lost = true;
+    if (c->live)
+    {
+      c->live_good = 0;
+    }
+    else
+    {
+      if (c->active && c->last_valid && (fix->t_ms - c->last.t_ms) > 1000) c->active = false;
+      try_start_live(c, fix->t_ms);
+    }
   }
 }

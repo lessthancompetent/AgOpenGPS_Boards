@@ -1,4 +1,5 @@
-// Dead-reckoning coast core (Phase 0 shadow estimator + Phase 2 curve/slope models).
+// Dead-reckoning coast core (Phase 0 shadow estimator, Phase 2 curve/slope models,
+// Phase 3 ground-speed pulse, Phase 1 live coast state machine).
 // Pure C11, no Arduino dependencies, no heap. Also compiled by the host test in
 // Firmware/tests/coast/. See Firmware/docs/dead_reckoning_coast_design.md.
 //
@@ -7,10 +8,9 @@
 //   right(psi) = (E: cos psi, N: -sin psi)
 // Antenna = axle + a*fwd(psi) + h*sin(roll)*right(psi), roll positive right-side-down.
 //
-// Phase 2 additions, all learned while GNSS is good and used while integrating:
-//   - WAS sign and effective wheelbase L_eff from v*tan(delta)/yawrate on turns
-//   - speed observer on turns: v_obs = yawrate * L_eff / tan(delta)
-//   - crab gain k [deg per unit sin(roll)]: slip crab = k*sin(roll) + residual
+// One integrator serves two purposes:
+//   shadow window  (active && !live): restarted from a live fix every shadow_window_s, error reported
+//   live coast     (active &&  live): started from the last RTK fix when the fix is lost, output to AgIO
 #ifndef ZCOASTCORE_H
 #define ZCOASTCORE_H
 
@@ -22,6 +22,8 @@ extern "C" {
 #endif
 
 #define COAST_AUTO_OFFSET 999.0f   // dual_heading_offset_deg: learn the 0/90/180/270 quadrant from track vs heading
+
+enum { COAST_END_NONE = 0, COAST_END_RECOVERED = 1, COAST_END_TIMEOUT = 2, COAST_END_SENSOR = 3 };
 
 typedef struct {
   float wheelbase_m;             // L nominal (L_eff is learned around it)
@@ -36,6 +38,10 @@ typedef struct {
   bool  speed_observer;          // Phase 2: use yawrate*L_eff/tan(delta) to track speed on turns
   bool  crab_model;              // Phase 2: slip crab follows k*sin(roll)
   bool  ext_speed;               // Phase 3: use the external (ground-speed pulse) speed when fresh
+  bool  live_enable;             // Phase 1: start a live coast when the fix is lost
+  float live_max_s;              // Phase 1: hard time cap
+  float live_max_m;              // Phase 1: hard distance cap
+  bool  live_on_float;           // Phase 1: treat RTK float as lost
 } coast_config_t;
 
 typedef struct {
@@ -68,6 +74,31 @@ typedef struct {
   float    ext_scale;                   // learned external-speed scale factor (0 if not learned)
 } coast_report_t;
 
+// Live coast output for one sentence
+typedef struct {
+  double   lat_deg, lon_deg;            // coasted antenna position
+  float    alt_m;
+  float    heading_deg;                 // vehicle heading (true)
+  float    track_deg;                   // heading + crab
+  float    roll_deg, pitch_deg;         // raw TM171 values (same encoding AgIO already receives)
+  float    v_mps;
+  float    hdop;                        // grows with coast time
+  uint32_t elapsed_ms;
+  float    dist_m;
+  bool     imu_fallback;                // heading currently from the wheel model, not the IMU
+} coast_out_t;
+
+typedef struct {
+  int      reason;                      // COAST_END_*
+  uint32_t duration_ms;
+  float    dist_m;
+  bool     has_error;                   // along/cross valid (a real fix was seen)
+  float    along_m, cross_m;            // fix - prediction at the end
+  float    v_start_mps;
+  bool     forced;
+  bool     used_fallback;
+} coast_live_report_t;
+
 typedef struct {
   coast_config_t cfg;
 
@@ -93,16 +124,20 @@ typedef struct {
   float    ext_v_raw_mps; uint32_t ext_t_ms; bool ext_valid;
   float    ext_scale;     bool ext_scale_valid; int ext_scale_n; uint32_t ext_scale_t_ms;
 
-  // last good fix
+  // last good fix, and last sentence of any quality (for silence detection)
   coast_fix_t last;       bool last_valid;
+  uint32_t last_any_ms;   bool last_any_valid;
+  bool     gnss_lost;
 
-  // integrator (shadow now, live coast in Phase 1)
+  // integrator
   bool     active;
+  bool     live;
   double   n_m, e_m;          // rear axle relative to the start antenna position
   double   lat0_deg, lon0_deg;// start antenna position
   double   rm_m, rn_m;        // earth radii at lat0
+  float    alt_m;
   float    psi_deg;           // current vehicle heading estimate
-  float    v_mps;             // speed estimate (held, or observed on turns)
+  float    v_mps;             // speed estimate
   float    v_start_mps;
   float    beta_deg;          // current crab in use
   float    beta_res_deg;      // residual crab at window start (after removing k*sin(roll))
@@ -117,13 +152,27 @@ typedef struct {
   float    along_m, cross_m, max_abs_along_m, max_abs_cross_m;
   uint32_t fix_count;
   coast_report_t report;  bool report_ready;
+
+  // live coast
+  int      live_good;         // consecutive RTK fixes seen while live
+  bool     imu_fallback, live_used_fallback;
+  uint32_t tick_t_us;         bool tick_valid;
+  bool     forced;            uint32_t force_until_ms;
+  bool     live_forced;       // this live coast was started by coast_force()
+  bool     q0_pending;        // emit one quality-0 sentence (coast ended by timeout / sensor loss)
+  float    roll_at_loss_deg;  // raw TM171 roll when the coast started
+  float    dual_roll_at_loss_deg;
+  coast_live_report_t live_report; bool live_report_ready;
 } coast_t;
 
 void  coast_init(coast_t *c, const coast_config_t *cfg);
 void  coast_imu(coast_t *c, uint32_t t_us, float yaw_deg, float roll_deg, float pitch_deg);
 void  coast_was(coast_t *c, float steer_deg);
 void  coast_ext_speed(coast_t *c, uint32_t t_ms, float v_raw_mps);   // ~20 Hz, raw pulse speed along the ground
-void  coast_gnss(coast_t *c, const coast_fix_t *fix);
+void  coast_gnss(coast_t *c, const coast_fix_t *fix);                 // every KSXT, any quality
+void  coast_tick(coast_t *c, uint32_t t_us);                          // call every loop: silence, IMU fallback, caps
+void  coast_force(coast_t *c, uint32_t now_ms, float seconds);        // field test: coast for N s while GNSS is good
+bool  coast_live_output(const coast_t *c, uint32_t now_ms, coast_out_t *out);
 bool  coast_predict_antenna(const coast_t *c, double *lat_deg, double *lon_deg);
 float coast_vehicle_heading(const coast_t *c, float hdg_raw_deg);   // KSXT heading + offset, or <0 if unknown
 

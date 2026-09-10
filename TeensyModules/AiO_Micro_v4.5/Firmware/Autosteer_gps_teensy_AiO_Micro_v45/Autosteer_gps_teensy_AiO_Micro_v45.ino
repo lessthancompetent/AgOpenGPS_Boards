@@ -55,6 +55,17 @@ const int32_t baudRTK = 9600;     // most are using Xbee radios with default of 
 #define COAST_SPEED_PULSE_PIN        -1
 #define COAST_PULSES_PER_M           130.0f
 #define COAST_EXT_SPEED              true      // use the pulse speed when present (needs the pin above)
+// Phase 1 (live coast output). OFF by default: turn on only once the $COASTSHADOW numbers look right and
+// AgOpenGPS has been checked against the chosen sentence. While live, the receiver's own sentences are held
+// back and a coasted position goes out every 100 ms; one quality-0 sentence is sent when the coast times out.
+#define COAST_LIVE_ENABLE            false
+#define COAST_MAX_S                  20.0f     // hard time cap
+#define COAST_MAX_M                  60.0f     // hard distance cap
+#define COAST_ON_FLOAT               false     // treat RTK float as lost (default: float passes through as today)
+#define COAST_OUTPUT_KSXT            false     // false: $PANDA with fix quality 6 (design); true: synthetic $KSXT (Plan B)
+#define COAST_KSXT_QUALITY           2         // KSXT position quality while coasting (AgIO maps 2 -> float)
+#define COAST_KSXT_ROLL_SIGN         1.0f      // sign relating TM171 roll changes to the KSXT "pitch" (roll) field
+#define COAST_PANDA_HEADING_TRUE     true      // PANDA field 12: true vehicle heading, or raw TM171 yaw if false
 
 // Baudrates for detecting UBX receiver
 uint32_t baudrates[]
@@ -609,6 +620,21 @@ void loop()
             {
                 passThroughGPS = false;
                 passThroughGPS2 = false;
+                aogSerialCmdCounter = 0;
+            }
+            // "!AOGCO,<seconds>": force a dead-reckoning coast while GNSS is good (field test, see zCoast.ino)
+            else if (aogSerialCmdBuffer[aogSerialCmdCounter] == 'C' && aogSerialCmdBuffer[aogSerialCmdCounter + 1] == 'O')
+            {
+                int secs = 0;
+                uint32_t t0 = millis();
+                while (millis() - t0 < 50)
+                {
+                    if (!SerialAOG.available()) continue;
+                    char ch = SerialAOG.read();
+                    if (ch >= '0' && ch <= '9') secs = secs * 10 + (ch - '0');
+                    else if (ch == '\n' || ch == '\r') break;
+                }
+                coastForce(secs);
                 aogSerialCmdCounter = 0;
             }
         }

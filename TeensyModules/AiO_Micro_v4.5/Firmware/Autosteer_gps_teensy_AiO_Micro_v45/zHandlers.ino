@@ -330,6 +330,9 @@ void imuHandler()
 
 void BuildNmea(void)
 {
+    // A live dead-reckoning coast owns the output to AgIO
+    if (coastLive()) return;
+
     // If KSXT was recently received (within 500ms), skip PANDA/PAOGI generation
     if (ksxtReceived && (millis() - ksxtLastReceived < 500))
     {
@@ -568,6 +571,7 @@ void KSXT_Handler()
     strcat(ksxtBuffer, arg);
     switch (i)
     {
+      case 0:  strncpy(coastKsxtUtc, arg, sizeof(coastKsxtUtc) - 1); break;
       case 1:  kLon = strtod(arg, NULL); break;
       case 2:  kLat = strtod(arg, NULL); break;
       case 3:  kAlt = atof(arg); break;
@@ -575,13 +579,16 @@ void KSXT_Handler()
       case 5:  kPitch = atof(arg); break;
       case 6:  kTrack = atof(arg); break;
       case 7:  kVelKmh = atof(arg); break;
+      case 8:  strncpy(coastKsxtRollField, arg, sizeof(coastKsxtRollField) - 1); break;
       case 9:  kPosQ = atoi(arg); break;
       case 10: kHdgQ = atoi(arg); break;
+      case 11: strncpy(coastKsxtSatsSlave, arg, sizeof(coastKsxtSatsSlave) - 1); break;
+      case 12: strncpy(coastKsxtSatsMaster, arg, sizeof(coastKsxtSatsMaster) - 1); break;
       default: break;
     }
   }
 
-  coastOnKSXT(millis(), kLat, kLon, kAlt, kPosQ, kHdgQ, kHdg, kTrack, kVelKmh / 3.6f, kPitch);
+  bool forwardKsxt = coastOnKSXT(millis(), kLat, kLon, kAlt, kPosQ, kHdgQ, kHdg, kTrack, kVelKmh / 3.6f, kPitch);
   
   // Add checksum calculation
   int16_t sum = 0;
@@ -596,7 +603,10 @@ void KSXT_Handler()
   // Mark KSXT as received and record timestamp
   ksxtReceived = true;
   ksxtLastReceived = millis();
-  
+
+  // While a live coast runs, the receiver's (quality-0) sentences stay here; zCoast sends the coasted position.
+  if (!forwardKsxt) return;
+
   // Forward to AgIO immediately
   if (!passThroughGPS && !passThroughGPS2)
   {
