@@ -33,7 +33,7 @@ coast_out_t coastLastOut;
 bool coastLastOutValid = false;
 uint32_t coastLastEmitMs = 0;
 
-// Vehicle geometry: compile-time defaults < EEPROM (last value received) < AgOpenGPS PGN 208 / "!AOGCG" command
+// Vehicle geometry: compile-time defaults < EEPROM (last value received) < AgOpenGPS PGN 209 / "!AOGCG" command
 #define COAST_EE_ADDR  100          // steer settings use 0..70
 #define COAST_EE_IDENT 0xC0A5
 struct CoastGeomEE { uint16_t ident; int16_t wheelbase_cm, pivot_cm, height_cm, offset_cm; };

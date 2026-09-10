@@ -166,12 +166,12 @@ Compile-time constants in the user-settings block of the main sketch, matching t
 
 The geometry no longer has to be compiled in. Precedence: compile-time defaults (from the "6480" profile) < EEPROM (last value received) < a live update. Two ways to update:
 
-- **AgOpenGPS PGN 208 (0xD0)** over the usual UDP port 8888, to be sent whenever the vehicle settings are saved and once after connecting. AgOpenGPS does not send this today; it is a small addition to your fork.
+- **AgOpenGPS PGN 209 (0xD1)** over the usual UDP port 8888, to be sent whenever the vehicle settings are saved and once after connecting. Sent by `FormGPS.SendVehicleGeometry()` in the AgOpenGPS-farm fork (with the other module settings, and on every geometry edit). 0xD0 was avoided because AgOpenGPS already reserves it for a latitude/longitude message.
 
   | byte | value |
   |---|---|
   | 0–2 | `0x80 0x81 0x7F` |
-  | 3 | `0xD0` (208) |
+  | 3 | `0xD1` (209) |
   | 4 | length = 8 |
   | 5–6 | wheelbase, cm, uint16 LE |
   | 7–8 | antenna pivot, cm, int16 LE (positive = antenna ahead of the rear axle) |
