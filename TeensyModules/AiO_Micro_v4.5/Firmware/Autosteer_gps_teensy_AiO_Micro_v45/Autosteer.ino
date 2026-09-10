@@ -723,6 +723,21 @@ void ReceiveUdp()
 				steerConfigInit();
 
 			}//end FB
+
+			// 208 (0xD0) - vehicle geometry for the dead-reckoning coast, sent by AgOpenGPS whenever the vehicle
+			// settings change. Payload (cm, little-endian): wheelbase u16, antenna pivot i16, antenna height u16,
+			// antenna offset i16 (AOG sign: + = antenna left). See docs/dead_reckoning_coast_design.md.
+			else if (autoSteerUdpData[3] == 0xD0)
+			{
+				if (autoSteerUdpData[4] >= 8)
+				{
+					float L = (float)(uint16_t)(autoSteerUdpData[5] | (autoSteerUdpData[6] << 8)) * 0.01f;
+					float a = (float)(int16_t)(autoSteerUdpData[7] | (autoSteerUdpData[8] << 8)) * 0.01f;
+					float h = (float)(uint16_t)(autoSteerUdpData[9] | (autoSteerUdpData[10] << 8)) * 0.01f;
+					float o = (float)(int16_t)(autoSteerUdpData[11] | (autoSteerUdpData[12] << 8)) * 0.01f;
+					coastApplyGeometry(L, a, h, o, "AgOpenGPS PGN 208", true);
+				}
+			}
 			else if (autoSteerUdpData[3] == 200) // Hello from AgIO
 			{
 				if (Autosteer_running)

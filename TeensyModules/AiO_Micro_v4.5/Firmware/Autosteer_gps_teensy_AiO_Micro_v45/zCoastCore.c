@@ -88,13 +88,20 @@ float coast_vehicle_heading(const coast_t *c, float hdg_raw_deg)
 // ----------------------------------------------------------------------------- helpers
 static float imu_roll(const coast_t *c) { return c->cfg.imu_roll_sign * c->roll_deg; }
 static float imu_yaw(const coast_t *c)  { return c->cfg.imu_yaw_sign * c->yaw_deg; }
+static float lateral_right(const coast_t *c, float roll_deg);
 
-// Rear axle offset from the antenna, in the current heading/roll: axle = antenna - a*fwd - h*sin(roll)*right
+// Lateral position of the antenna relative to the axle centreline: roll lean plus the fixed offset
+static float lateral_right(const coast_t *c, float roll_deg)
+{
+  return c->cfg.antenna_height_m * sinf(roll_deg * (float)DEG2RAD) + c->cfg.antenna_right_m;
+}
+
+// Rear axle offset from the antenna, in the current heading/roll: axle = antenna - a*fwd - hr*right
 static void axle_from_antenna(const coast_t *c, float psi_deg, float roll_deg, double *dn, double *de)
 {
   double s = sin(psi_deg * DEG2RAD), co = cos(psi_deg * DEG2RAD);
   double a = c->cfg.antenna_fwd_m;
-  double hr = c->cfg.antenna_height_m * sin(roll_deg * DEG2RAD);
+  double hr = lateral_right(c, roll_deg);
   *de = -a * s - hr * co;
   *dn = -a * co + hr * s;
 }
@@ -120,7 +127,7 @@ static float antenna_lateral_mps(const coast_t *c)
 
 static float axle_speed(const coast_t *c, float v_antenna_mps)
 {
-  float hr = c->cfg.antenna_height_m * sinf(imu_roll(c) * (float)DEG2RAD);
+  float hr = lateral_right(c, imu_roll(c));
   float lat = antenna_lateral_mps(c);
   float along2 = v_antenna_mps * v_antenna_mps - lat * lat;
   float along = along2 > 0.0f ? sqrtf(along2) : 0.0f;
@@ -133,7 +140,7 @@ static float slip_crab(const coast_t *c, const coast_fix_t *fix)
 {
   float veh = coast_vehicle_heading(c, fix->hdg_raw_deg);
   float beta_total = coast_wrap180(fix->track_deg - veh);
-  float hr = c->cfg.antenna_height_m * sinf(imu_roll(c) * (float)DEG2RAD);
+  float hr = lateral_right(c, imu_roll(c));
   float along = axle_speed(c, fix->v_mps) - hr * c->yaw_rate_dps * (float)DEG2RAD;
   float beta_kin = (float)(atan2((double)antenna_lateral_mps(c), (double)along) * RAD2DEG);
   return coast_wrap180(beta_total - beta_kin);
@@ -241,7 +248,7 @@ bool coast_predict_antenna(const coast_t *c, double *lat_deg, double *lon_deg)
   if (!c->active) return false;
   double s = sin(c->psi_deg * DEG2RAD), co = cos(c->psi_deg * DEG2RAD);
   double a = c->cfg.antenna_fwd_m;
-  double hr = c->cfg.antenna_height_m * sin(imu_roll(c) * DEG2RAD);
+  double hr = lateral_right(c, imu_roll(c));
   double e = c->e_m + a * s + hr * co;
   double n = c->n_m + a * co - hr * s;
   *lat_deg = c->lat0_deg + (n / c->rm_m) * RAD2DEG;
@@ -473,6 +480,8 @@ static void finish_window(coast_t *c, const coast_fix_t *fix)
 }
 
 // ----------------------------------------------------------------------------- live coast
+static void apply_geometry(coast_t *c, float L, float a, float h, float o);
+
 static void end_live(coast_t *c, uint32_t now_ms, int reason)
 {
   coast_live_report_t *r = &c->live_report;
@@ -489,6 +498,11 @@ static void end_live(coast_t *c, uint32_t now_ms, int reason)
   c->live = false;
   c->active = false;
   c->imu_fallback = false;
+  if (c->geom_pending)
+  {
+    c->geom_pending = false;
+    apply_geometry(c, c->geom_L, c->geom_a, c->geom_h, c->geom_o);
+  }
 }
 
 // Start a live coast from the last RTK fix, if everything needed is fresh.
@@ -512,6 +526,40 @@ static void try_start_live(coast_t *c, uint32_t now_ms)
   // motion since that fix (up to LIVE_MAX_FIX_AGE_MS): straight at the current heading
   float gap = (float)(int32_t)(now_ms - c->last.t_ms) * 1e-3f;
   if (gap > 0.0f) integrate(c, gap, c->psi_deg, imu_roll(c), now_ms);
+}
+
+static void apply_geometry(coast_t *c, float L, float a, float h, float o)
+{
+  bool L_changed = fabsf(L - c->cfg.wheelbase_m) > 0.01f;
+  c->cfg.wheelbase_m = L;
+  c->cfg.antenna_fwd_m = a;
+  c->cfg.antenna_height_m = h;
+  c->cfg.antenna_right_m = o;
+  if (L_changed)
+  {
+    // L_eff is learned around L and clamped to it: start again
+    c->leff_valid = false; c->leff_n = 0;
+  }
+  // the antenna geometry enters the crab and slip estimates: relearn them
+  c->beta_slip_valid = false; c->k_valid = false; c->k_n = 0;
+  c->ext_scale_valid = false; c->ext_scale_n = 0;
+  if (c->active && !c->live) c->active = false;   // shadow window no longer consistent
+}
+
+bool coast_set_geometry(coast_t *c, float wheelbase_m, float antenna_fwd_m, float antenna_height_m, float antenna_right_m)
+{
+  if (!(wheelbase_m > 0.5f && wheelbase_m < 10.0f)) return false;
+  if (!(antenna_fwd_m > -10.0f && antenna_fwd_m < 10.0f)) return false;
+  if (!(antenna_height_m >= 0.0f && antenna_height_m < 10.0f)) return false;
+  if (!(antenna_right_m > -5.0f && antenna_right_m < 5.0f)) return false;
+  if (c->live)
+  {
+    c->geom_pending = true;
+    c->geom_L = wheelbase_m; c->geom_a = antenna_fwd_m; c->geom_h = antenna_height_m; c->geom_o = antenna_right_m;
+    return true;
+  }
+  apply_geometry(c, wheelbase_m, antenna_fwd_m, antenna_height_m, antenna_right_m);
+  return true;
 }
 
 void coast_force(coast_t *c, uint32_t now_ms, float seconds)

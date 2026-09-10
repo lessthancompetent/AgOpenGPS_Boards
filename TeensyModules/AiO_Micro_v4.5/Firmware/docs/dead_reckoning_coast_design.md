@@ -6,6 +6,8 @@ Firmware feature for the AiO Micro v4.5 port (UM982 + TM171 + Keya). 2026-09-10.
 
 **Phase 1 as built.** Entry: a KSXT with position quality 0/1 (2 = float too if `COAST_ON_FLOAT`), or no KSXT for 250 ms, while the last RTK-fixed fix is at most 1 s old, the TM171 packet at most 100 ms old, and the heading offset is learned. The integrator starts from that last fix and first integrates the gap since it. While live the receiver's own KSXT/GGA-derived sentences are held back and a coasted sentence goes out every 100 ms: `$PANDA` with fix quality 6, growing HDOP and the coast age in the DGPS-age field (default), or a synthetic `$KSXT` with `COAST_KSXT_QUALITY` (Plan B, `COAST_OUTPUT_KSXT`). Exit on the second consecutive RTK-fixed fix (AgOpenGPS steps to the true position; `$COASTREPORT` prints the true error), or on `COAST_MAX_S` / `COAST_MAX_M` (one quality-0 sentence is sent so AgOpenGPS disengages), or on sensor loss. If the TM171 stops for 200 ms the heading is carried by the wheel model `v·tan δ / L_eff`; if the WAS is invalid too the coast ends. Float fixes neither start nor end a coast. `!AOGCO,10` on USB forces a 10 s coast while GNSS is good, so the report holds the true error. Host tests (`tests/coast/run_tests.sh`) replay a 15 s outage on the sloped curve with the position withheld as truth: max error 5 cm along / 14 cm cross with the pulse, recovery on the second fix; receiver silence, the 20 s cap with the quality-0 sentence, and the forced coast are covered too.
 
+**Prebuilt hexes** (`build_coast_hexes.sh`, geometry defaults from the "6480" profile, overridable at runtime per §10a): `…_coast-shadow.hex` (measure only), `…_coast-live.hex` (coast on GNSS loss, PANDA quality 6, no speed pulse), `…_coast-live-pulse37.hex` (same, ground-speed pulse on pin 37).
+
 **Sharing the tractor speed signal.** The ISO 11786 speed pin is an output; a seed drill controller and the AiO board can both listen to it. Tap it as a parallel branch through the resistor divider (about 1 mA load) with a common ground, and the drill sees no difference.
 
 **Phase 3 as built.** `COAST_SPEED_PULSE_PIN` (default −1 = off) counts pulses in an interrupt (100 µs glitch filter) and converts them to a raw speed every 50 ms from the pulse timestamps, using `COAST_PULSES_PER_M` (130 for ISO 11786). The core learns a scale factor against the GNSS axle speed (30 s low-pass, valid after 50 samples), projects the speed to the horizontal with `cos(pitch)`, and uses it whenever it is under 300 ms old; otherwise it falls back to the observer/hold. When the pin is 37 (`REMOTE_PIN`) the remote-switch read reports "open" and the encoder kickout is disabled automatically. **Hardware:** Teensy 4.1 pins are 3.3 V only; an ISO 11786 signal swings to battery voltage, so put a resistor divider (e.g. 10 kΩ / 3.3 kΩ) or an optocoupler in front of the pin, and check the tractor's connector pinout (pin 1 radar ground speed, pin 2 wheel speed). On the synthetic drive the pulse removes the straight-line speed hold entirely: the post-curve window goes from 7.9 m to 0.09 m along-track. Code: `zCoastCore.h/.c` (pure C core, also built by `tests/coast/run_tests.sh` against the Python reference model), `zCoast.ino` (glue), settings in the main sketch's user-settings block.
@@ -159,6 +161,29 @@ Compile-time constants in the user-settings block of the main sketch, matching t
 | `COAST_ANTENNA_HEIGHT_M` | — | `h`, must equal AOG antenna height |
 | `COAST_SPEED_PULSE_PIN` | −1 | Phase 3 input, −1 = none |
 | `COAST_PULSES_PER_M` | 130 | ISO 11786 ground-speed signal |
+
+### 10a. Vehicle geometry at runtime
+
+The geometry no longer has to be compiled in. Precedence: compile-time defaults (from the "6480" profile) < EEPROM (last value received) < a live update. Two ways to update:
+
+- **AgOpenGPS PGN 208 (0xD0)** over the usual UDP port 8888, to be sent whenever the vehicle settings are saved and once after connecting. AgOpenGPS does not send this today; it is a small addition to your fork.
+
+  | byte | value |
+  |---|---|
+  | 0–2 | `0x80 0x81 0x7F` |
+  | 3 | `0xD0` (208) |
+  | 4 | length = 8 |
+  | 5–6 | wheelbase, cm, uint16 LE |
+  | 7–8 | antenna pivot, cm, int16 LE (positive = antenna ahead of the rear axle) |
+  | 9–10 | antenna height, cm, uint16 LE |
+  | 11–12 | antenna offset, cm, int16 LE, AgOpenGPS sign (+ = antenna left of centre) |
+  | 13 | CRC = sum of bytes 2–12, low byte (same as the other PGNs) |
+
+  Fill from `setVehicle_wheelbase`, `setVehicle_antennaPivot`, `setVehicle_antennaHeight`, `setVehicle_antennaOffset`.
+
+- **USB command** `!AOGCG,2.8,0.1,3.0,-0.35` (metres, AgOpenGPS signs) from any serial monitor.
+
+Both print `$COASTMSG,geometry applied …` and store the value in EEPROM (only when it changed). A change that arrives during a live coast is applied when that coast ends. Changing the wheelbase restarts the `L_eff` learning; any change restarts the crab, slip and pulse-scale learning, since the antenna geometry enters all of them.
 
 ## 11. Shadow mode and validation
 

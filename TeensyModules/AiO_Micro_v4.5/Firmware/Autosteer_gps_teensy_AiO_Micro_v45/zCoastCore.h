@@ -6,7 +6,8 @@
 // Frames: N/E metres, heading in degrees clockwise from north.
 //   fwd(psi)   = (E: sin psi, N: cos psi)
 //   right(psi) = (E: cos psi, N: -sin psi)
-// Antenna = axle + a*fwd(psi) + h*sin(roll)*right(psi), roll positive right-side-down.
+// Antenna = axle + a*fwd(psi) + (h*sin(roll) + o)*right(psi), roll positive right-side-down,
+// o = lateral antenna offset to the right.
 //
 // One integrator serves two purposes:
 //   shadow window  (active && !live): restarted from a live fix every shadow_window_s, error reported
@@ -29,6 +30,7 @@ typedef struct {
   float wheelbase_m;             // L nominal (L_eff is learned around it)
   float antenna_fwd_m;           // a, antenna ahead of the rear axle (= AOG antenna pivot)
   float antenna_height_m;        // h (= AOG antenna height)
+  float antenna_right_m;         // antenna right of the centreline, metres (= -(AOG antenna offset))
   float imu_yaw_sign;            // +1 if TM171 yaw grows clockwise like a compass heading, else -1
   float imu_roll_sign;           // +1 if TM171 roll is positive right-side-down (AOG convention), else -1
   float dual_heading_offset_deg; // added to KSXT heading to get vehicle heading, or COAST_AUTO_OFFSET
@@ -163,6 +165,9 @@ typedef struct {
   float    roll_at_loss_deg;  // raw TM171 roll when the coast started
   float    dual_roll_at_loss_deg;
   coast_live_report_t live_report; bool live_report_ready;
+
+  // geometry update received while a live coast was running: applied when it ends
+  bool     geom_pending; float geom_L, geom_a, geom_h, geom_o;
 } coast_t;
 
 void  coast_init(coast_t *c, const coast_config_t *cfg);
@@ -172,6 +177,9 @@ void  coast_ext_speed(coast_t *c, uint32_t t_ms, float v_raw_mps);   // ~20 Hz, 
 void  coast_gnss(coast_t *c, const coast_fix_t *fix);                 // every KSXT, any quality
 void  coast_tick(coast_t *c, uint32_t t_us);                          // call every loop: silence, IMU fallback, caps
 void  coast_force(coast_t *c, uint32_t now_ms, float seconds);        // field test: coast for N s while GNSS is good
+// Runtime geometry update (from AgOpenGPS or a USB command). Applied immediately unless a live coast is
+// running, in which case it is applied when that coast ends. Returns false if the values are implausible.
+bool  coast_set_geometry(coast_t *c, float wheelbase_m, float antenna_fwd_m, float antenna_height_m, float antenna_right_m);
 bool  coast_live_output(const coast_t *c, uint32_t now_ms, coast_out_t *out);
 bool  coast_predict_antenna(const coast_t *c, double *lat_deg, double *lon_deg);
 float coast_vehicle_heading(const coast_t *c, float hdg_raw_deg);   // KSXT heading + offset, or <0 if unknown

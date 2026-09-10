@@ -33,6 +33,56 @@ coast_out_t coastLastOut;
 bool coastLastOutValid = false;
 uint32_t coastLastEmitMs = 0;
 
+// Vehicle geometry: compile-time defaults < EEPROM (last value received) < AgOpenGPS PGN 208 / "!AOGCG" command
+#define COAST_EE_ADDR  100          // steer settings use 0..70
+#define COAST_EE_IDENT 0xC0A5
+struct CoastGeomEE { uint16_t ident; int16_t wheelbase_cm, pivot_cm, height_cm, offset_cm; };
+
+// offsetAog uses the AgOpenGPS sign (+ = antenna left of centre)
+void coastApplyGeometry(float L, float a, float h, float offsetAog, const char *source, bool save)
+{
+  if (!coastInitDone) coastInit();
+  bool ok = coast_set_geometry(&coastState, L, a, h, -offsetAog);
+  Serial.print("$COASTMSG,geometry ");
+  Serial.print(ok ? (coastState.geom_pending ? "queued (coast running)" : "applied") : "REJECTED");
+  Serial.print(" from "); Serial.print(source);
+  Serial.print(": L="); Serial.print(L, 2);
+  Serial.print(" pivot="); Serial.print(a, 2);
+  Serial.print(" height="); Serial.print(h, 2);
+  Serial.print(" offset="); Serial.println(offsetAog, 2);
+  if (!ok || !save) return;
+
+  CoastGeomEE ee;
+  ee.ident = COAST_EE_IDENT;
+  ee.wheelbase_cm = (int16_t)lroundf(L * 100.0f);
+  ee.pivot_cm     = (int16_t)lroundf(a * 100.0f);
+  ee.height_cm    = (int16_t)lroundf(h * 100.0f);
+  ee.offset_cm    = (int16_t)lroundf(offsetAog * 100.0f);
+  CoastGeomEE cur;
+  EEPROM.get(COAST_EE_ADDR, cur);
+  if (memcmp(&cur, &ee, sizeof(ee)) != 0) EEPROM.put(COAST_EE_ADDR, ee);   // only write on change
+}
+
+// "!AOGCG,L,pivot,height,offset" (metres, AOG signs)
+void coastGeometryCommand(const char *args)
+{
+  // ",L,a,h,o" -> four floats (strtof, not sscanf: %f scanning costs ~28 KB of flash)
+  float v[4];
+  const char *p = args;
+  int n = 0;
+  while (n < 4)
+  {
+    if (*p == ',') p++;
+    char *end;
+    v[n] = strtof(p, &end);
+    if (end == p) break;
+    n++;
+    p = end;
+  }
+  if (n == 4) coastApplyGeometry(v[0], v[1], v[2], v[3], "USB !AOGCG", true);
+  else Serial.println("$COASTMSG,usage: !AOGCG,wheelbase,antennaPivot,antennaHeight,antennaOffset (m)");
+}
+
 // Ground-speed pulse input (Phase 3). Counted in an interrupt, sampled every 50 ms.
 #if COAST_SPEED_PULSE_PIN >= 0
 volatile uint32_t coastPulseCount = 0;
@@ -59,6 +109,7 @@ void coastInit()
   cfg.wheelbase_m             = COAST_WHEELBASE_M;
   cfg.antenna_fwd_m           = COAST_ANTENNA_FWD_M;
   cfg.antenna_height_m        = COAST_ANTENNA_HEIGHT_M;
+  cfg.antenna_right_m         = -(COAST_ANTENNA_OFFSET_M);   // AOG: + = antenna left of centre
   cfg.imu_yaw_sign            = COAST_IMU_YAW_SIGN;
   cfg.imu_roll_sign           = COAST_IMU_ROLL_SIGN;
   cfg.dual_heading_offset_deg = COAST_DUAL_HEADING_OFFSET_DEG;
@@ -74,6 +125,17 @@ void coastInit()
   cfg.live_on_float           = COAST_ON_FLOAT;
   coast_init(&coastState, &cfg);
   coastInitDone = true;
+
+  CoastGeomEE ee;
+  EEPROM.get(COAST_EE_ADDR, ee);
+  if (ee.ident == COAST_EE_IDENT)
+  {
+    coastApplyGeometry(ee.wheelbase_cm * 0.01f, ee.pivot_cm * 0.01f, ee.height_cm * 0.01f, ee.offset_cm * 0.01f, "EEPROM", false);
+  }
+  else
+  {
+    Serial.println("$COASTMSG,geometry from compile-time defaults (no EEPROM value yet)");
+  }
 
 #if COAST_SPEED_PULSE_PIN >= 0
   pinMode(COAST_SPEED_PULSE_PIN, INPUT_PULLUP);

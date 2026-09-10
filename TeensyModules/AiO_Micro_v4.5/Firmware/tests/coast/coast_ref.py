@@ -17,7 +17,7 @@ DEG = math.pi / 180.0
 A = 6378137.0
 E2 = 0.00669437999014
 
-CFG = dict(wheelbase_m=2.6, antenna_fwd_m=1.2, antenna_height_m=2.8,
+CFG = dict(wheelbase_m=2.6, antenna_fwd_m=1.2, antenna_height_m=2.8, antenna_right_m=0.35,
            imu_yaw_sign=1.0, imu_roll_sign=1.0, dual_heading_offset_deg=999.0,
            shadow_window_s=20.0, min_speed_mps=0.5, was_sign=0.0,
            speed_observer=True, crab_model=True, ext_speed=True)
@@ -57,7 +57,7 @@ def gen(path, seed=1):
     rnd = random.Random(seed)
     lat0, lon0 = 47.30000, 11.20000
     rm, rn = radii(lat0)
-    L = CFG['wheelbase_m']; a = CFG['antenna_fwd_m']; h = CFG['antenna_height_m']
+    L = CFG['wheelbase_m']; a = CFG['antenna_fwd_m']; h = CFG['antenna_height_m']; o = CFG['antenna_right_m']
     dt = 0.01
     n = e = 0.0; psi = 20.0
     rows = []
@@ -88,7 +88,7 @@ def gen(path, seed=1):
         chi = (psi + beta) * DEG
         n += v * math.cos(chi) * dt; e += v * math.sin(chi) * dt
         s, c = math.sin(psi * DEG), math.cos(psi * DEG)
-        hr = h * math.sin(roll * DEG)
+        hr = h * math.sin(roll * DEG) + o
         ae = e + a * s + hr * c; an = n + a * c - hr * s
         roll_rate = (roll - prev_roll) / dt if k > 0 else 0.0
         prev_roll = roll
@@ -146,6 +146,10 @@ class Coast:
 
     def imu_roll(self):
         return self.cfg['imu_roll_sign'] * self.roll
+
+    def lateral_right(self, roll_deg):
+        c = self.cfg
+        return c['antenna_height_m'] * math.sin(roll_deg * DEG) + c['antenna_right_m']
 
     def turning(self):
         if not (self.was_valid and self.was_sign_valid): return None
@@ -210,7 +214,7 @@ class Coast:
     def predict(self):
         c = self.cfg
         s, co = math.sin(self.psi * DEG), math.cos(self.psi * DEG)
-        hr = c['antenna_height_m'] * math.sin(self.imu_roll() * DEG)
+        hr = self.lateral_right(self.imu_roll())
         e = self.e + c['antenna_fwd_m'] * s + hr * co
         n = self.n + c['antenna_fwd_m'] * co - hr * s
         return (self.lat0 + n / self.rm / DEG, self.lon0 + e / (self.rn * math.cos(self.lat0 * DEG)) / DEG)
@@ -223,7 +227,7 @@ class Coast:
 
     def axle_speed(self, v_ant):
         c = self.cfg
-        hr = c['antenna_height_m'] * math.sin(self.imu_roll() * DEG)
+        hr = self.lateral_right(self.imu_roll())
         lat = self.antenna_lateral()
         along2 = v_ant * v_ant - lat * lat
         along = math.sqrt(along2) if along2 > 0 else 0.0
@@ -233,7 +237,7 @@ class Coast:
     def slip_crab(self, hdg_raw, track, v):
         c = self.cfg
         beta_total = wrap180(track - self.veh(hdg_raw))
-        hr = c['antenna_height_m'] * math.sin(self.imu_roll() * DEG)
+        hr = self.lateral_right(self.imu_roll())
         along = self.axle_speed(v) - hr * self.yaw_rate * DEG
         beta_kin = math.degrees(math.atan2(self.antenna_lateral(), along))
         return wrap180(beta_total - beta_kin)
@@ -364,7 +368,7 @@ class Coast:
             self.lat0, self.lon0 = lat, lon
             self.rm, self.rn = radii(lat)
             s, co = math.sin(self.psi * DEG), math.cos(self.psi * DEG)
-            hr = c['antenna_height_m'] * math.sin(self.imu_roll() * DEG)
+            hr = self.lateral_right(self.imu_roll())
             self.e = -c['antenna_fwd_m'] * s - hr * co
             self.n = -c['antenna_fwd_m'] * co + hr * s
             self.dist = 0.0; self.t_start = t_ms

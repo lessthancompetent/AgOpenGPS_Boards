@@ -38,9 +38,11 @@ const int32_t baudRTK = 9600;     // most are using Xbee radios with default of 
 #define COAST_SHADOW_MODE            true      // run the shadow estimator
 #define COAST_LOG_USB                false     // 10 Hz $COAST log lines on USB for offline replay
 #define COAST_SHADOW_WINDOW_S        20.0f     // shadow window length, seconds
-#define COAST_WHEELBASE_M            2.6f      // L  -- set for your tractor
-#define COAST_ANTENNA_FWD_M          1.2f      // a  -- antenna ahead of rear axle = AOG "antenna pivot"
-#define COAST_ANTENNA_HEIGHT_M       2.8f      // h  -- = AOG "antenna height"
+// Geometry from the AgOpenGPS vehicle profile "6480" (VehicleProfiles/6480.xml, 2026-08-23). Keep in step with it.
+#define COAST_WHEELBASE_M            2.8f      // L  -- setVehicle_wheelbase
+#define COAST_ANTENNA_FWD_M          0.1f      // a  -- setVehicle_antennaPivot (antenna ahead of the rear axle)
+#define COAST_ANTENNA_HEIGHT_M       3.0f      // h  -- setVehicle_antennaHeight
+#define COAST_ANTENNA_OFFSET_M       -0.35f    // setVehicle_antennaOffset, AOG sign: + = antenna left of centre (-0.35 = 0.35 m right)
 #define COAST_IMU_YAW_SIGN           1.0f      // +1 if TM171 yaw grows clockwise (compass sense), else -1
 #define COAST_IMU_ROLL_SIGN          1.0f      // +1 if TM171 roll is positive right-side-down (AOG sense), else -1
 #define COAST_DUAL_HEADING_OFFSET_DEG COAST_AUTO_OFFSET  // KSXT heading -> vehicle heading; AUTO learns 0/90/180/270
@@ -52,17 +54,23 @@ const int32_t baudRTK = 9600;     // most are using Xbee radios with default of 
 // carries pulses the remote switch reads as "open" and the encoder kickout is disabled. Teensy 4.1 pins are 3.3 V only:
 // a 12 V ISO 11786 signal (connector pin 1 = radar ground speed, pin 2 = wheel speed, 130 pulses/m) needs a resistor
 // divider or an optocoupler in front of the pin. The firmware learns a scale correction against GNSS.
+#ifndef COAST_SPEED_PULSE_PIN            // build_coast_hexes.sh overrides this with -D
 #define COAST_SPEED_PULSE_PIN        -1
+#endif
 #define COAST_PULSES_PER_M           130.0f
 #define COAST_EXT_SPEED              true      // use the pulse speed when present (needs the pin above)
 // Phase 1 (live coast output). OFF by default: turn on only once the $COASTSHADOW numbers look right and
 // AgOpenGPS has been checked against the chosen sentence. While live, the receiver's own sentences are held
 // back and a coasted position goes out every 100 ms; one quality-0 sentence is sent when the coast times out.
+#ifndef COAST_LIVE_ENABLE                // build_coast_hexes.sh overrides this with -D
 #define COAST_LIVE_ENABLE            false
+#endif
 #define COAST_MAX_S                  20.0f     // hard time cap
 #define COAST_MAX_M                  60.0f     // hard distance cap
 #define COAST_ON_FLOAT               false     // treat RTK float as lost (default: float passes through as today)
+#ifndef COAST_OUTPUT_KSXT
 #define COAST_OUTPUT_KSXT            false     // false: $PANDA with fix quality 6 (design); true: synthetic $KSXT (Plan B)
+#endif
 #define COAST_KSXT_QUALITY           2         // KSXT position quality while coasting (AgIO maps 2 -> float)
 #define COAST_KSXT_ROLL_SIGN         1.0f      // sign relating TM171 roll changes to the KSXT "pitch" (roll) field
 #define COAST_PANDA_HEADING_TRUE     true      // PANDA field 12: true vehicle heading, or raw TM171 yaw if false
@@ -623,18 +631,23 @@ void loop()
                 aogSerialCmdCounter = 0;
             }
             // "!AOGCO,<seconds>": force a dead-reckoning coast while GNSS is good (field test, see zCoast.ino)
-            else if (aogSerialCmdBuffer[aogSerialCmdCounter] == 'C' && aogSerialCmdBuffer[aogSerialCmdCounter + 1] == 'O')
+            // "!AOGCG,L,pivot,height,offset": set the coast vehicle geometry (metres, AgOpenGPS signs)
+            else if (aogSerialCmdBuffer[aogSerialCmdCounter] == 'C' &&
+                     (aogSerialCmdBuffer[aogSerialCmdCounter + 1] == 'O' || aogSerialCmdBuffer[aogSerialCmdCounter + 1] == 'G'))
             {
-                int secs = 0;
+                char args[48];
+                uint8_t n = 0;
                 uint32_t t0 = millis();
-                while (millis() - t0 < 50)
+                while (millis() - t0 < 50 && n < sizeof(args) - 1)
                 {
                     if (!SerialAOG.available()) continue;
                     char ch = SerialAOG.read();
-                    if (ch >= '0' && ch <= '9') secs = secs * 10 + (ch - '0');
-                    else if (ch == '\n' || ch == '\r') break;
+                    if (ch == '\n' || ch == '\r') break;
+                    args[n++] = ch;
                 }
-                coastForce(secs);
+                args[n] = 0;
+                if (aogSerialCmdBuffer[aogSerialCmdCounter + 1] == 'O') coastForce(atoi(args[0] == ',' ? args + 1 : args));
+                else coastGeometryCommand(args);
                 aogSerialCmdCounter = 0;
             }
         }

@@ -21,7 +21,7 @@ int main(int argc, char **argv)
 
   coast_config_t cfg;
   memset(&cfg, 0, sizeof cfg);
-  cfg.wheelbase_m = 2.6f; cfg.antenna_fwd_m = 1.2f; cfg.antenna_height_m = 2.8f;
+  cfg.wheelbase_m = 2.6f; cfg.antenna_fwd_m = 1.2f; cfg.antenna_height_m = 2.8f; cfg.antenna_right_m = 0.35f;
   cfg.imu_yaw_sign = 1.0f; cfg.imu_roll_sign = 1.0f; cfg.dual_heading_offset_deg = COAST_AUTO_OFFSET;
   cfg.shadow_window_s = 20.0f; cfg.min_speed_mps = 0.5f; cfg.was_sign = 0.0f;
   cfg.speed_observer = true; cfg.crab_model = true; cfg.ext_speed = true;
