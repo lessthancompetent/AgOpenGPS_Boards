@@ -1,6 +1,8 @@
 # Dead-Reckoning Coast — Design
 
-Firmware feature for the AiO Micro v4.5 port (UM982 + TM171 + Keya). Status: **design only, not implemented.** 2026-09-10.
+Firmware feature for the AiO Micro v4.5 port (UM982 + TM171 + Keya). 2026-09-10.
+
+**Status: Phase 0 implemented** (KSXT parsing, USB logging, shadow mode; nothing AgIO receives is changed). Phases 1–3 are design only. Code: `zCoastCore.h/.c` (pure C core, also built by `tests/coast/run_tests.sh` against the Python reference model), `zCoast.ino` (glue), settings in the main sketch's user-settings block.
 
 ## 1. Problem
 

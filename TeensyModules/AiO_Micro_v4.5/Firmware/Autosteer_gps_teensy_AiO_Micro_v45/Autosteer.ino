@@ -430,6 +430,8 @@ void autosteerLoop()
 		//Ackerman fix
 		if (steerAngleActual < 0) steerAngleActual = (steerAngleActual * steerSettings.AckermanFix);
 
+		coastOnWas(steerAngleActual);
+
 		if (watchdogTimer < WATCHDOG_THRESHOLD)
 		{
 			//Enable H Bridge for IBT2, hyd aux, etc for cytron. Don't care about this for Keya

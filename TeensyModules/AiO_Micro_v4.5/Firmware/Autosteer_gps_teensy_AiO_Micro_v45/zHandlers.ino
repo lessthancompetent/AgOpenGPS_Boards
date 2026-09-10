@@ -549,16 +549,39 @@ void KSXT_Handler()
   char sentence[256];
   parser.getType(sentence);
   
-  // Reconstruct the full sentence with all arguments
+  // Reconstruct the full sentence with all arguments, and pick out the fields the coast core needs.
+  // KSXT (Unicore N4 reference, table 7-127), parser arg index = manual field ID - 2:
+  //   0 UTC, 1 lon, 2 lat, 3 height, 4 heading, 5 pitch (AgIO uses this as roll), 6 track true,
+  //   7 speed km/h, 8 roll, 9 pos quality (0 none,1 single,2 float,3 fixed), 10 heading quality,
+  //   11/12 sats slave/master, 13-15 E/N/U pos, 16-18 E/N/U velocity km/h
+  double kLon = 0, kLat = 0;
+  float kAlt = 0, kHdg = 0, kPitch = 0, kTrack = 0, kVelKmh = 0;
+  int kPosQ = 0, kHdgQ = 0;
+
   strcpy(ksxtBuffer, "$");
   strcat(ksxtBuffer, sentence);
-  
+
   for(int i = 0; i < parser.argCount(); i++) {
     strcat(ksxtBuffer, ",");
     char arg[64];
     parser.getArg(i, arg);
     strcat(ksxtBuffer, arg);
+    switch (i)
+    {
+      case 1:  kLon = strtod(arg, NULL); break;
+      case 2:  kLat = strtod(arg, NULL); break;
+      case 3:  kAlt = atof(arg); break;
+      case 4:  kHdg = atof(arg); break;
+      case 5:  kPitch = atof(arg); break;
+      case 6:  kTrack = atof(arg); break;
+      case 7:  kVelKmh = atof(arg); break;
+      case 9:  kPosQ = atoi(arg); break;
+      case 10: kHdgQ = atoi(arg); break;
+      default: break;
+    }
   }
+
+  coastOnKSXT(millis(), kLat, kLon, kAlt, kPosQ, kHdgQ, kHdg, kTrack, kVelKmh / 3.6f, kPitch);
   
   // Add checksum calculation
   int16_t sum = 0;

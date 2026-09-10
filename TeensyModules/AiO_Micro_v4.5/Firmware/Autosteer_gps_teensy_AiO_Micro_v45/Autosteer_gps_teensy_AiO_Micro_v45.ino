@@ -28,9 +28,22 @@ HardwareSerialIMXRT* SerialGPSTmp = NULL;
 //HardwareSerialIMXRT* SerialIMU = &Serial5;   //IMU BNO-085
 //HardwareSerialIMXRT* SerialAOG = &Serial;
 
-const int32_t baudAOG = 115200; 
+const int32_t baudAOG = 115200;
 const int32_t baudGPS = 460800;
 const int32_t baudRTK = 9600;     // most are using Xbee radios with default of 115200
+
+// Dead-reckoning coast (docs/dead_reckoning_coast_design.md).
+// Phase 0 = shadow mode only: the estimator runs against live GNSS and prints $COASTSHADOW lines on USB.
+// Nothing AgIO receives is changed. Geometry MUST match the AgOpenGPS vehicle settings.
+#define COAST_SHADOW_MODE            true      // run the shadow estimator
+#define COAST_LOG_USB                false     // 10 Hz $COAST log lines on USB for offline replay
+#define COAST_SHADOW_WINDOW_S        20.0f     // shadow window length, seconds
+#define COAST_WHEELBASE_M            2.6f      // L  -- set for your tractor
+#define COAST_ANTENNA_FWD_M          1.2f      // a  -- antenna ahead of rear axle = AOG "antenna pivot"
+#define COAST_ANTENNA_HEIGHT_M       2.8f      // h  -- = AOG "antenna height"
+#define COAST_IMU_YAW_SIGN           1.0f      // +1 if TM171 yaw grows clockwise (compass sense), else -1
+#define COAST_IMU_ROLL_SIGN          1.0f      // +1 if TM171 roll is positive right-side-down (AOG sense), else -1
+#define COAST_DUAL_HEADING_OFFSET_DEG COAST_AUTO_OFFSET  // KSXT heading -> vehicle heading; AUTO learns 0/90/180/270
 
 // Baudrates for detecting UBX receiver
 uint32_t baudrates[]
@@ -374,6 +387,8 @@ void setup()
 
   Serial.println("Right... time for some CANBUS! And, we're dedicated to Keya here");
   CAN_Setup();
+
+  coastInit();
 
   Serial.println("\r\nEnd setup, waiting for GPS...\r\n");
 }

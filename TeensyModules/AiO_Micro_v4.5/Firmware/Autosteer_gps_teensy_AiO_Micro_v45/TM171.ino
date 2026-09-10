@@ -121,7 +121,9 @@ void TM171process() {
           YawV.fBytes[1] = ImuData[20];
           YawV.fBytes[2] = ImuData[21];
           YawV.fBytes[3] = ImuData[22];
-      
+
+          coastOnImu(micros(), YawV.fValue, RollV.fValue, PitchV.fValue);
+
 #ifdef TM171DEBUG
           Serial.print("yaw=");
           Serial.print(YawV.fValue);
