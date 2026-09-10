@@ -378,7 +378,11 @@ void autosteerLoop()
 			}
 		}
 
+#if COAST_SPEED_PULSE_PIN == REMOTE_PIN
+		remoteSwitch = 1;                       //pin carries the coast ground-speed pulse: report "open" (pull-up idle state)
+#else
 		remoteSwitch = digitalRead(REMOTE_PIN); //read auto steer enable switch open = 0n closed = Off
+#endif
 		switchByte = 0;
 		switchByte |= (remoteSwitch << 2); //put remote in bit 2
 		switchByte |= (steerSwitch << 1);   //put steerswitch status in bit 1 position
@@ -518,7 +522,7 @@ void autosteerLoop()
 		noTone(velocityPWM_Pin);
 	}
 
-	if (encEnable)
+	if (encEnable && COAST_SPEED_PULSE_PIN != REMOTE_PIN)   // encoder kickout shares the pin with the speed pulse
 	{
 		thisEnc = digitalRead(REMOTE_PIN);
 		if (thisEnc != lastEnc)

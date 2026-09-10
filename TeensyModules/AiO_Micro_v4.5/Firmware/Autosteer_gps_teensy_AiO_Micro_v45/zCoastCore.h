@@ -35,6 +35,7 @@ typedef struct {
   float was_sign;                // +1 if positive WAS = right turn, -1 if left, 0 = learn from yaw rate
   bool  speed_observer;          // Phase 2: use yawrate*L_eff/tan(delta) to track speed on turns
   bool  crab_model;              // Phase 2: slip crab follows k*sin(roll)
+  bool  ext_speed;               // Phase 3: use the external (ground-speed pulse) speed when fresh
 } coast_config_t;
 
 typedef struct {
@@ -63,6 +64,8 @@ typedef struct {
   float    k_crab;                      // crab gain in use, deg per unit sin(roll) (0 if not learned)
   float    was_sign;                    // WAS sign in use (0 if not learned)
   float    observer_frac;               // fraction of integration steps where the speed observer was active
+  float    ext_frac;                    // fraction of integration steps that used the external speed
+  float    ext_scale;                   // learned external-speed scale factor (0 if not learned)
 } coast_report_t;
 
 typedef struct {
@@ -86,6 +89,10 @@ typedef struct {
   // WAS
   float    was_deg;       bool was_valid;
 
+  // external speed (ground-speed pulse), raw = nominal pulses-per-metre conversion
+  float    ext_v_raw_mps; uint32_t ext_t_ms; bool ext_valid;
+  float    ext_scale;     bool ext_scale_valid; int ext_scale_n; uint32_t ext_scale_t_ms;
+
   // last good fix
   coast_fix_t last;       bool last_valid;
 
@@ -104,7 +111,7 @@ typedef struct {
   float    dist_m;
   uint32_t t_start_ms;
   uint32_t t_last_us;
-  uint32_t int_samples, obs_samples;
+  uint32_t int_samples, obs_samples, ext_samples;
 
   // shadow statistics
   float    along_m, cross_m, max_abs_along_m, max_abs_cross_m;
@@ -115,6 +122,7 @@ typedef struct {
 void  coast_init(coast_t *c, const coast_config_t *cfg);
 void  coast_imu(coast_t *c, uint32_t t_us, float yaw_deg, float roll_deg, float pitch_deg);
 void  coast_was(coast_t *c, float steer_deg);
+void  coast_ext_speed(coast_t *c, uint32_t t_ms, float v_raw_mps);   // ~20 Hz, raw pulse speed along the ground
 void  coast_gnss(coast_t *c, const coast_fix_t *fix);
 bool  coast_predict_antenna(const coast_t *c, double *lat_deg, double *lon_deg);
 float coast_vehicle_heading(const coast_t *c, float hdg_raw_deg);   // KSXT heading + offset, or <0 if unknown

@@ -4,11 +4,11 @@
 // estimator in shadow mode against live GNSS, and prints its error on USB:
 //
 //   $COASTSHADOW,dur_s,dist_m,along_m,cross_m,maxAlong_m,maxCross_m,delta_deg,offset_deg,beta_deg,
-//                vStart,vEnd,fixes,Leff_m,k_crab,wasSign,obsFrac
+//                vStart,vEnd,fixes,Leff_m,k_crab,wasSign,obsFrac,extFrac,extScale
 //       one line per shadow window (default every 20 s while moving with an RTK fix + TM171).
-//       cross_m is the number that matters for steering. Leff/k/wasSign are 0 until learned.
+//       cross_m is the number that matters for steering. Leff/k/wasSign/extScale are 0 until learned.
 //   $COAST,t_ms,lat,lon,posq,hdgq,hdg_raw,track,v_mps,dual_roll,yaw,roll,pitch,was_deg,delta,offset,
-//          active,along,cross,Leff,k
+//          active,along,cross,Leff,k,pulse_v_raw
 //       one line per KSXT when COAST_LOG_USB is true (10 Hz), for offline replay with tests/coast/coast_ref.py
 //
 // Settings live in the user-settings block of the main sketch. Design: docs/dead_reckoning_coast_design.md
@@ -17,6 +17,25 @@
 
 coast_t coastState;
 bool coastInitDone = false;
+
+// Ground-speed pulse input (Phase 3). Counted in an interrupt, sampled every 50 ms.
+#if COAST_SPEED_PULSE_PIN >= 0
+volatile uint32_t coastPulseCount = 0;
+volatile uint32_t coastPulseLastUs = 0;
+void coastPulseIsr()
+{
+  uint32_t now = micros();
+  if ((now - coastPulseLastUs) > 100)      // glitch filter: ISO 11786 tops out around 1.5 kHz
+  {
+    coastPulseCount++;
+    coastPulseLastUs = now;
+  }
+}
+#endif
+uint32_t coastPulsePrevCount = 0;
+uint32_t coastPulsePrevUs = 0;
+float    coastPulseSpeed = 0.0f;
+elapsedMillis coastPulseTimer;
 
 void coastInit()
 {
@@ -33,8 +52,14 @@ void coastInit()
   cfg.was_sign                = COAST_WAS_SIGN;
   cfg.speed_observer          = COAST_SPEED_OBSERVER;
   cfg.crab_model              = COAST_CRAB_MODEL;
+  cfg.ext_speed               = COAST_EXT_SPEED && (COAST_SPEED_PULSE_PIN >= 0);
   coast_init(&coastState, &cfg);
   coastInitDone = true;
+
+#if COAST_SPEED_PULSE_PIN >= 0
+  pinMode(COAST_SPEED_PULSE_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(COAST_SPEED_PULSE_PIN), coastPulseIsr, RISING);
+#endif
 
   Serial.print("Coast: shadow mode ");
   Serial.print(COAST_SHADOW_MODE ? "ON" : "OFF");
@@ -52,7 +77,40 @@ void coastInit()
   Serial.print(COAST_SPEED_OBSERVER ? "ON" : "OFF");
   Serial.print(", crab model ");
   Serial.print(COAST_CRAB_MODEL ? "ON" : "OFF");
+  Serial.print(", speed pulse ");
+  if (COAST_SPEED_PULSE_PIN >= 0) { Serial.print("pin "); Serial.print(COAST_SPEED_PULSE_PIN); Serial.print(" @ "); Serial.print(COAST_PULSES_PER_M); Serial.print(" p/m"); }
+  else Serial.print("none");
   Serial.println(". Output to AgIO is unchanged.");
+}
+
+// Called from loop(): converts the pulse count into a raw speed every 50 ms and feeds the core.
+void coastLoop()
+{
+#if COAST_SPEED_PULSE_PIN >= 0
+  if (!COAST_SHADOW_MODE || !coastInitDone) return;
+  if (coastPulseTimer < 50) return;
+  coastPulseTimer = 0;
+
+  uint32_t cnt, lastUs;
+  noInterrupts();
+  cnt = coastPulseCount; lastUs = coastPulseLastUs;
+  interrupts();
+  uint32_t nowUs = micros();
+
+  if (cnt != coastPulsePrevCount)
+  {
+    uint32_t dp = cnt - coastPulsePrevCount;
+    float dtp = (float)(lastUs - coastPulsePrevUs) * 1e-6f;
+    if (coastPulsePrevUs != 0 && dtp > 0.0f) coastPulseSpeed = (float)dp / COAST_PULSES_PER_M / dtp;
+    coastPulsePrevCount = cnt;
+    coastPulsePrevUs = lastUs;
+  }
+  else if ((nowUs - lastUs) > 500000u)
+  {
+    coastPulseSpeed = 0.0f;       // no pulse for 0.5 s: stopped
+  }
+  coast_ext_speed(&coastState, millis(), coastPulseSpeed);
+#endif
 }
 
 // Called from TM171.ino for every function-code-35 packet.
@@ -105,7 +163,9 @@ void coastOnKSXT(uint32_t t_ms, double lat, double lon, float alt, int posQ, int
     Serial.print(r->leff_m, 3);                 Serial.print(",");
     Serial.print(r->k_crab, 2);                 Serial.print(",");
     Serial.print(r->was_sign, 0);               Serial.print(",");
-    Serial.println(r->observer_frac, 2);
+    Serial.print(r->observer_frac, 2);          Serial.print(",");
+    Serial.print(r->ext_frac, 2);               Serial.print(",");
+    Serial.println(r->ext_scale, 4);
     coastState.report_ready = false;
   }
 
@@ -131,6 +191,7 @@ void coastOnKSXT(uint32_t t_ms, double lat, double lon, float alt, int posQ, int
     Serial.print(coastState.along_m, 3);     Serial.print(",");
     Serial.print(coastState.cross_m, 3);     Serial.print(",");
     Serial.print(coastState.leff_valid ? coastState.leff_m : 0.0f, 3); Serial.print(",");
-    Serial.println(coastState.k_valid ? coastState.k_crab : 0.0f, 2);
+    Serial.print(coastState.k_valid ? coastState.k_crab : 0.0f, 2);    Serial.print(",");
+    Serial.println(coastState.ext_valid ? coastState.ext_v_raw_mps : -1.0f, 3);
   }
 }

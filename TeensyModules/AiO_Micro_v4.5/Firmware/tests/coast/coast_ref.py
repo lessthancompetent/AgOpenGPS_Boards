@@ -1,13 +1,14 @@
-"""Reference model + synthetic drive for the dead-reckoning coast core (Phase 0 + Phase 2).
+"""Reference model + synthetic drive for the dead-reckoning coast core (Phases 0, 2, 3).
 
 Usage:
-  python coast_ref.py gen  scenario.csv          # write a synthetic input log (IMU 100 Hz, WAS 25 Hz, KSXT 10 Hz)
+  python coast_ref.py gen  scenario.csv          # write a synthetic input log (IMU 100 Hz, WAS 25 Hz, pulse 20 Hz, KSXT 10 Hz)
   python coast_ref.py run  scenario.csv [flags]  # run the Python reference model, print shadow reports
-     flags: --no-observer  --no-crab            # A/B the Phase 2 models
+     flags: --no-observer  --no-crab  --no-ext   # A/B the Phase 2/3 models
 The host C test (coast_host_test.c) reads the same CSV and must print the same reports.
 
 CSV rows:  t_us,I,yaw,roll,pitch           (TM171 code 35, raw values)
            t_us,W,steer_deg
+           t_us,S,v_raw_mps                (ground-speed pulse, nominal pulses-per-metre conversion)
            t_us,G,lat,lon,alt,posq,hdgq,hdg_raw,track,v_mps,dual_roll
 """
 import math, sys, random
@@ -19,12 +20,13 @@ E2 = 0.00669437999014
 CFG = dict(wheelbase_m=2.6, antenna_fwd_m=1.2, antenna_height_m=2.8,
            imu_yaw_sign=1.0, imu_roll_sign=1.0, dual_heading_offset_deg=999.0,
            shadow_window_s=20.0, min_speed_mps=0.5, was_sign=0.0,
-           speed_observer=True, crab_model=True)
+           speed_observer=True, crab_model=True, ext_speed=True)
 
 TURN_MIN_WAS = 5.0; TURN_MIN_RATE = 2.0; LEARN_MIN_V = 1.0; CRAB_MIN_ROLL = 3.0; K_LIMIT = 30.0
 CRAB_MAX_ROLL_RATE = 3.0; SLIP_TAU = 1.0; RES_TAU = 5.0
 LEFF_TAU = 10.0; K_TAU = 10.0; OBS_TAU = 0.25; OBS_MAX_ACC = 1.5; OBS_MAX_RATIO = 1.25
 WAS_MIN_VOTES = 20; LEFF_MIN_N = 10; K_MIN_N = 50
+EXT_TIMEOUT_MS = 300; EXT_SCALE_TAU = 30.0; EXT_SCALE_MIN_N = 50
 
 
 def wrap180(a):
@@ -49,8 +51,9 @@ def gen(path, seed=1):
     """Rear-axle bicycle truth, 70 s. Two identical R=25 m right-hand curves (10-28 s and 40-58 s) on a
     12 deg right-down side slope with 2 deg downhill crab, slowing 2.5 -> 1.8 m/s through each; straight
     and flat in between. The WAS is wired with inverted sign (negative = right) to exercise sign learning.
-    Antenna 1.2 m ahead, 2.8 m up. KSXT heading reported 90 deg off the vehicle heading (left/right
-    antennas). IMU yaw has a 37 deg offset and slow drift. Roll/crab ramp in over 1 s."""
+    A ground-speed pulse is emitted at 20 Hz with a 3 % scale error and 1 % noise. Antenna 1.2 m ahead,
+    2.8 m up. KSXT heading reported 90 deg off the vehicle heading (left/right antennas). IMU yaw has a
+    37 deg offset and slow drift. Roll/crab ramp in over 1 s."""
     rnd = random.Random(seed)
     lat0, lon0 = 47.30000, 11.20000
     rm, rn = radii(lat0)
@@ -78,7 +81,6 @@ def gen(path, seed=1):
             roll = 12.0 * ramp
             beta = 2.0 * ramp
         else:
-            # straight: accelerate back to 2.5 after a curve
             v = 2.5 if t < 10 else min(2.5, 1.8 + 0.35 * (t - (28.0 if t < 40 else 58.0)))
             delta = 0.0; roll = 0.0; beta = 0.0
         psi_dot = math.degrees(v * math.tan(delta * DEG) / L)
@@ -88,8 +90,6 @@ def gen(path, seed=1):
         s, c = math.sin(psi * DEG), math.cos(psi * DEG)
         hr = h * math.sin(roll * DEG)
         ae = e + a * s + hr * c; an = n + a * c - hr * s
-        # true antenna velocity (for a Doppler-like KSXT track/speed): axle velocity + rotation of the
-        # (a, hr) offset + sideways swing of the antenna as the roll changes
         roll_rate = (roll - prev_roll) / dt if k > 0 else 0.0
         prev_roll = roll
         w = psi_dot * DEG
@@ -101,6 +101,8 @@ def gen(path, seed=1):
         rows.append((t_us, 'I', f"{yaw:.4f}", f"{roll + rnd.gauss(0, 0.05):.4f}", f"{rnd.gauss(0, 0.05):.4f}"))
         if k % 4 == 0:
             rows.append((t_us, 'W', f"{-delta + rnd.gauss(0, 0.1):.3f}"))   # inverted WAS sign
+        if k % 5 == 0:
+            rows.append((t_us, 'S', f"{v * 1.03 * (1.0 + rnd.gauss(0, 0.01)):.4f}"))
         if k % 10 == 0:
             track = wrap360(math.degrees(math.atan2(ve, vn)) + rnd.gauss(0, 0.3))
             vant = max(0.0, math.hypot(ve, vn) + rnd.gauss(0, 0.02))
@@ -133,6 +135,8 @@ class Coast:
         self.yaw = self.roll = self.pitch = 0.0; self.yaw_rate = 0.0; self.roll_rate = 0.0
         self.imu_t = 0; self.imu_valid = False
         self.was = 0.0; self.was_valid = False
+        self.ext_raw = 0.0; self.ext_t = 0; self.ext_valid = False
+        self.ext_scale = 0.0; self.ext_scale_valid = False; self.ext_scale_n = 0; self.ext_scale_t = 0
         self.last = None
         self.active = False
         self.reports = []
@@ -148,6 +152,16 @@ class Coast:
         d = self.was_sign * self.was
         if abs(d) > TURN_MIN_WAS and abs(self.yaw_rate) > TURN_MIN_RATE: return d
         return None
+
+    def ext_speed(self, t_ms, v_raw):
+        self.ext_raw = max(0.0, v_raw); self.ext_t = t_ms; self.ext_valid = True
+
+    def ext_fresh(self, now_ms):
+        return self.cfg['ext_speed'] and self.ext_valid and (now_ms - self.ext_t) <= EXT_TIMEOUT_MS
+
+    def ext_h(self):
+        s = self.ext_scale if self.ext_scale_valid else 1.0
+        return self.ext_raw * s * math.cos(self.pitch * DEG)
 
     def imu(self, t_us, yaw, roll, pitch):
         c = self.cfg
@@ -168,7 +182,10 @@ class Coast:
                     else:
                         self.beta = self.beta_res
                     d = self.turning()
-                    if c['speed_observer'] and self.leff_valid and d is not None:
+                    if self.ext_fresh(t_us // 1000):
+                        self.v = self.ext_h()
+                        self.ext_n += 1
+                    elif c['speed_observer'] and self.leff_valid and d is not None:
                         v_obs = abs(self.yaw_rate * DEG * self.leff / math.tan(d * DEG))
                         a_obs = dt / (dt + OBS_TAU)
                         dv = (v_obs - self.v) * a_obs
@@ -275,6 +292,20 @@ class Coast:
                     self.leff = max(0.5 * L, min(2.0 * L, self.leff))
                     self.leff_t = t_ms; self.leff_n += 1
                     if self.leff_n >= LEFF_MIN_N: self.leff_valid = True
+        # external speed scale
+        if c['ext_speed'] and self.imu_valid and v >= LEARN_MIN_V and self.ext_fresh(t_ms):
+            raw_h = self.ext_raw * math.cos(self.pitch * DEG)
+            if raw_h >= 0.5:
+                ratio = self.axle_speed(v) / raw_h
+                if 0.5 < ratio < 2.0:
+                    if self.ext_scale_n == 0:
+                        self.ext_scale = ratio
+                    else:
+                        dt = (t_ms - self.ext_scale_t) * 1e-3
+                        if dt <= 0 or dt > 2.0: dt = 0.1
+                        self.ext_scale += (ratio - self.ext_scale) * (dt / (dt + EXT_SCALE_TAU))
+                    self.ext_scale_t = t_ms; self.ext_scale_n += 1
+                    if self.ext_scale_n >= EXT_SCALE_MIN_N: self.ext_scale_valid = True
         # low-passed slip crab
         if self.quad_valid and self.imu_valid and hdgq == 3 and v >= LEARN_MIN_V:
             raw = self.slip_crab(hdg_raw, track, v)
@@ -314,13 +345,16 @@ class Coast:
                     beta=self.beta_entry, v_start=self.v_start, v_end=v, fixes=self.count,
                     leff=self.leff if self.leff_valid else 0.0, k=self.k if self.k_valid else 0.0,
                     was_sign=self.was_sign if self.was_sign_valid else 0.0,
-                    obs_frac=(self.obs_n / self.int_n) if self.int_n else 0.0))
+                    obs_frac=(self.obs_n / self.int_n) if self.int_n else 0.0,
+                    ext_frac=(self.ext_n / self.int_n) if self.int_n else 0.0,
+                    ext_scale=self.ext_scale if self.ext_scale_valid else 0.0))
                 self.active = False
         self.last = (t_ms,)
         if (not self.active and self.delta_valid and self.quad_valid and self.imu_valid and v >= c['min_speed_mps']):
             self.delta_frozen = self.delta
             self.psi = wrap360(c['imu_yaw_sign'] * self.yaw + self.delta_frozen)
-            self.v = self.axle_speed(v); self.v_start = self.v
+            self.v = self.ext_h() if self.ext_fresh(t_ms) else self.axle_speed(v)
+            self.v_start = self.v
             self.beta_entry = self.slip if self.slip_valid else self.slip_crab(hdg_raw, track, v)
             if c['crab_model'] and self.k_valid:
                 self.beta_res = self.beta_entry - self.k * math.sin(self.imu_roll() * DEG)
@@ -335,7 +369,7 @@ class Coast:
             self.n = -c['antenna_fwd_m'] * co + hr * s
             self.dist = 0.0; self.t_start = t_ms
             self.along = self.cross = self.max_along = self.max_cross = 0.0; self.count = 0
-            self.int_n = self.obs_n = 0
+            self.int_n = self.obs_n = self.ext_n = 0
             self.active = True
 
 
@@ -350,14 +384,16 @@ def run(path, cfg=None):
                 m.imu(t_us, float(p[2]), float(p[3]), float(p[4]))
             elif p[1] == 'W':
                 m.was_in(float(p[2]))
+            elif p[1] == 'S':
+                m.ext_speed(t_us // 1000, float(p[2]))
             elif p[1] == 'G':
                 m.gnss(t_us // 1000, float(p[2]), float(p[3]), float(p[4]), int(p[5]), int(p[6]),
                        float(p[7]), float(p[8]), float(p[9]), float(p[10]))
     for r in m.reports:
-        print("REPORT,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%d,%.2f,%.3f,%.3f,%d,%.3f,%.3f,%.0f,%.3f" % (
+        print("REPORT,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%d,%.2f,%.3f,%.3f,%d,%.3f,%.3f,%.0f,%.3f,%.3f,%.4f" % (
             r['duration_ms'], r['dist'], r['along'], r['cross'], r['max_along'], r['max_cross'],
             r['delta'], r['offset'], r['beta'], r['v_start'], r['v_end'], r['fixes'],
-            r['leff'], r['k'], r['was_sign'], r['obs_frac']))
+            r['leff'], r['k'], r['was_sign'], r['obs_frac'], r['ext_frac'], r['ext_scale']))
 
 
 if __name__ == '__main__':
@@ -367,4 +403,5 @@ if __name__ == '__main__':
         cfg = dict(CFG)
         if '--no-observer' in sys.argv: cfg['speed_observer'] = False
         if '--no-crab' in sys.argv: cfg['crab_model'] = False
+        if '--no-ext' in sys.argv: cfg['ext_speed'] = False
         run(sys.argv[2], cfg)

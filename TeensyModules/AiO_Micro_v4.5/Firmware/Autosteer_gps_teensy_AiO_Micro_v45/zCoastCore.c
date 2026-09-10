@@ -25,6 +25,9 @@
 #define WAS_SIGN_MIN_VOTES   20
 #define LEFF_MIN_SAMPLES     10
 #define K_MIN_SAMPLES        50
+#define EXT_TIMEOUT_MS       300u
+#define EXT_SCALE_TAU_S      30.0f
+#define EXT_SCALE_MIN_SAMPLES 50
 
 float coast_wrap180(float a)
 {
@@ -85,6 +88,8 @@ static float imu_roll(const coast_t *c) { return c->cfg.imu_roll_sign * c->roll_
 static float imu_yaw(const coast_t *c)  { return c->cfg.imu_yaw_sign * c->yaw_deg; }
 static float antenna_lateral_mps(const coast_t *c);
 static float axle_speed(const coast_t *c, float v_antenna_mps);
+static bool  ext_speed_fresh(const coast_t *c, uint32_t now_ms);
+static float ext_speed_h(const coast_t *c);
 
 static bool turning(const coast_t *c, float *delta_deg)
 {
@@ -121,9 +126,14 @@ void coast_imu(coast_t *c, uint32_t t_us, float yaw_deg, float roll_deg, float p
         else
           c->beta_deg = c->beta_res_deg;
 
-        // speed observer on turns
+        // speed: external pulse when fresh, else observer on turns, else hold
         float d;
-        if (c->cfg.speed_observer && c->leff_valid && turning(c, &d))
+        if (ext_speed_fresh(c, t_us / 1000u))
+        {
+          c->v_mps = ext_speed_h(c);
+          c->ext_samples++;
+        }
+        else if (c->cfg.speed_observer && c->leff_valid && turning(c, &d))
         {
           float v_obs = fabsf(c->yaw_rate_dps * (float)DEG2RAD * c->leff_m / tanf(d * (float)DEG2RAD));
           float a_obs = dt / (dt + OBS_TAU_S);
@@ -156,6 +166,24 @@ void coast_imu(coast_t *c, uint32_t t_us, float yaw_deg, float roll_deg, float p
 void coast_was(coast_t *c, float steer_deg)
 {
   c->was_deg = steer_deg; c->was_valid = true;
+}
+
+void coast_ext_speed(coast_t *c, uint32_t t_ms, float v_raw_mps)
+{
+  c->ext_v_raw_mps = v_raw_mps < 0.0f ? 0.0f : v_raw_mps;
+  c->ext_t_ms = t_ms; c->ext_valid = true;
+}
+
+// External speed, scaled and projected to the horizontal: the pulse counts distance along the slope.
+static bool ext_speed_fresh(const coast_t *c, uint32_t now_ms)
+{
+  return c->cfg.ext_speed && c->ext_valid && (int32_t)(now_ms - c->ext_t_ms) <= (int32_t)EXT_TIMEOUT_MS;
+}
+
+static float ext_speed_h(const coast_t *c)
+{
+  float s = c->ext_scale_valid ? c->ext_scale : 1.0f;
+  return c->ext_v_raw_mps * s * cosf(c->pitch_deg * (float)DEG2RAD);
 }
 
 bool coast_predict_antenna(const coast_t *c, double *lat_deg, double *lon_deg)
@@ -286,6 +314,32 @@ static float slip_crab(const coast_t *c, const coast_fix_t *fix)
   return coast_wrap180(beta_total - beta_kin);
 }
 
+// External speed scale: GNSS axle speed / raw pulse speed, 30 s LPF. Absorbs tyre radius, radar
+// mounting angle and a wrong pulses-per-metre constant.
+static void learn_ext_scale(coast_t *c, const coast_fix_t *fix)
+{
+  if (!c->cfg.ext_speed || !c->imu_valid || fix->v_mps < LEARN_MIN_SPEED_MPS) return;
+  if (!ext_speed_fresh(c, fix->t_ms)) return;
+  float raw_h = c->ext_v_raw_mps * cosf(c->pitch_deg * (float)DEG2RAD);
+  if (raw_h < 0.5f) return;
+  float ratio = axle_speed(c, fix->v_mps) / raw_h;
+  if (!(ratio > 0.5f && ratio < 2.0f)) return;
+  if (c->ext_scale_n == 0)
+  {
+    c->ext_scale = ratio;
+  }
+  else
+  {
+    float dt = (float)(fix->t_ms - c->ext_scale_t_ms) * 1e-3f;
+    if (dt <= 0.0f || dt > 2.0f) dt = 0.1f;
+    float alpha = dt / (dt + EXT_SCALE_TAU_S);
+    c->ext_scale += (ratio - c->ext_scale) * alpha;
+  }
+  c->ext_scale_t_ms = fix->t_ms;
+  c->ext_scale_n++;
+  if (c->ext_scale_n >= EXT_SCALE_MIN_SAMPLES) c->ext_scale_valid = true;
+}
+
 // Low-passed slip crab (1 s): the KSXT track is noisy sample to sample, the crab is not.
 static void update_slip(coast_t *c, const coast_fix_t *fix)
 {
@@ -336,7 +390,7 @@ static void start_window(coast_t *c, const coast_fix_t *fix)
 {
   c->delta_frozen_deg = c->delta_deg;
   c->psi_deg = coast_wrap360(imu_yaw(c) + c->delta_frozen_deg);
-  c->v_mps = axle_speed(c, fix->v_mps);
+  c->v_mps = ext_speed_fresh(c, fix->t_ms) ? ext_speed_h(c) : axle_speed(c, fix->v_mps);
   c->v_start_mps = c->v_mps;
 
   c->beta_entry_deg = c->beta_slip_valid ? c->beta_slip_filt_deg : slip_crab(c, fix);
@@ -356,7 +410,7 @@ static void start_window(coast_t *c, const coast_fix_t *fix)
   c->along_m = c->cross_m = 0.0f;
   c->max_abs_along_m = c->max_abs_cross_m = 0.0f;
   c->fix_count = 0;
-  c->int_samples = c->obs_samples = 0;
+  c->int_samples = c->obs_samples = c->ext_samples = 0;
   c->active = true;
 }
 
@@ -390,6 +444,8 @@ static void finish_window(coast_t *c, const coast_fix_t *fix)
   r->k_crab = c->k_valid ? c->k_crab : 0.0f;
   r->was_sign = c->was_sign_valid ? c->was_sign : 0.0f;
   r->observer_frac = c->int_samples ? (float)c->obs_samples / (float)c->int_samples : 0.0f;
+  r->ext_frac = c->int_samples ? (float)c->ext_samples / (float)c->int_samples : 0.0f;
+  r->ext_scale = c->ext_scale_valid ? c->ext_scale : 0.0f;
   c->report_ready = true;
   c->active = false;
 }
@@ -407,6 +463,7 @@ void coast_gnss(coast_t *c, const coast_fix_t *fix)
   learn_quadrant(c, fix);
   learn_delta(c, fix);
   learn_wheelbase(c, fix);
+  learn_ext_scale(c, fix);
   update_slip(c, fix);
   learn_crab(c, fix);
 

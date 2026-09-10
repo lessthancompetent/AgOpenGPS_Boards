@@ -1,6 +1,6 @@
 // Host test for zCoastCore.c: replays a CSV log (see coast_ref.py) and prints shadow reports
 // in the same format as the Python reference model, so the two can be diffed.
-//   see run_tests.sh in this folder.  Flags: --no-observer --no-crab
+//   see run_tests.sh in this folder.  Flags: --no-observer --no-crab --no-ext
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,7 +8,7 @@
 
 int main(int argc, char **argv)
 {
-  if (argc < 2) { fprintf(stderr, "usage: %s log.csv [--no-observer] [--no-crab]\n", argv[0]); return 2; }
+  if (argc < 2) { fprintf(stderr, "usage: %s log.csv [--no-observer] [--no-crab] [--no-ext]\n", argv[0]); return 2; }
   FILE *f = fopen(argv[1], "r");
   if (!f) { perror(argv[1]); return 2; }
 
@@ -17,11 +17,12 @@ int main(int argc, char **argv)
   cfg.wheelbase_m = 2.6f; cfg.antenna_fwd_m = 1.2f; cfg.antenna_height_m = 2.8f;
   cfg.imu_yaw_sign = 1.0f; cfg.imu_roll_sign = 1.0f; cfg.dual_heading_offset_deg = COAST_AUTO_OFFSET;
   cfg.shadow_window_s = 20.0f; cfg.min_speed_mps = 0.5f; cfg.was_sign = 0.0f;
-  cfg.speed_observer = true; cfg.crab_model = true;
+  cfg.speed_observer = true; cfg.crab_model = true; cfg.ext_speed = true;
   for (int i = 2; i < argc; i++)
   {
     if (!strcmp(argv[i], "--no-observer")) cfg.speed_observer = false;
     if (!strcmp(argv[i], "--no-crab")) cfg.crab_model = false;
+    if (!strcmp(argv[i], "--no-ext")) cfg.ext_speed = false;
   }
   coast_t c;
   coast_init(&c, &cfg);
@@ -42,6 +43,10 @@ int main(int argc, char **argv)
     {
       coast_was(&c, strtof(p[2], NULL));
     }
+    else if (p[1][0] == 'S' && n >= 3)
+    {
+      coast_ext_speed(&c, t_us / 1000u, strtof(p[2], NULL));
+    }
     else if (p[1][0] == 'G' && n >= 11)
     {
       coast_fix_t fx;
@@ -54,10 +59,10 @@ int main(int argc, char **argv)
       if (c.report_ready)
       {
         coast_report_t *r = &c.report;
-        printf("REPORT,%u,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%d,%.2f,%.3f,%.3f,%u,%.3f,%.3f,%.0f,%.3f\n",
+        printf("REPORT,%u,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%d,%.2f,%.3f,%.3f,%u,%.3f,%.3f,%.0f,%.3f,%.3f,%.4f\n",
                (unsigned)r->duration_ms, r->dist_m, r->along_m, r->cross_m, r->max_abs_along_m, r->max_abs_cross_m,
                r->delta_deg, r->offset_deg, r->beta_deg, r->v_start_mps, r->v_end_mps, (unsigned)r->fix_count,
-               r->leff_m, r->k_crab, r->was_sign, r->observer_frac);
+               r->leff_m, r->k_crab, r->was_sign, r->observer_frac, r->ext_frac, r->ext_scale);
         c.report_ready = false;
         reports++;
       }

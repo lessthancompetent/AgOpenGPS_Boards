@@ -48,6 +48,13 @@ const int32_t baudRTK = 9600;     // most are using Xbee radios with default of 
 #define COAST_SPEED_OBSERVER         true      // on turns, track speed from yawrate * L_eff / tan(steer angle)
 #define COAST_CRAB_MODEL             true      // slip crab follows k * sin(roll), k learned on side slopes
 #define COAST_WAS_SIGN               0.0f      // +1 if positive WAS = right turn, -1 if left, 0 = learn from the gyro
+// Phase 3 (ground-speed pulse). -1 = none. Pin 37 (REMOTE_PIN, H_TEENSY header row 20) is the candidate input; while it
+// carries pulses the remote switch reads as "open" and the encoder kickout is disabled. Teensy 4.1 pins are 3.3 V only:
+// a 12 V ISO 11786 signal (connector pin 1 = radar ground speed, pin 2 = wheel speed, 130 pulses/m) needs a resistor
+// divider or an optocoupler in front of the pin. The firmware learns a scale correction against GNSS.
+#define COAST_SPEED_PULSE_PIN        -1
+#define COAST_PULSES_PER_M           130.0f
+#define COAST_EXT_SPEED              true      // use the pulse speed when present (needs the pin above)
 
 // Baudrates for detecting UBX receiver
 uint32_t baudrates[]
@@ -717,6 +724,7 @@ void loop()
 
     //RVC BNO08x
     TM171process();
+    coastLoop();
     if (useTM171 && imuTimer > 40 && imuTrigger)
     {
         imuTrigger = false;

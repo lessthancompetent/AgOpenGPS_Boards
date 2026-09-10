@@ -2,7 +2,9 @@
 
 Firmware feature for the AiO Micro v4.5 port (UM982 + TM171 + Keya). 2026-09-10.
 
-**Status: Phases 0 and 2 implemented** (KSXT parsing, USB logging, shadow mode, speed observer, wheelbase self-calibration with WAS-sign detection, crab model; nothing AgIO receives is changed). Phase 1 (live coast output) and Phase 3 (speed pulse) are design only. Code: `zCoastCore.h/.c` (pure C core, also built by `tests/coast/run_tests.sh` against the Python reference model), `zCoast.ino` (glue), settings in the main sketch's user-settings block.
+**Status: Phases 0, 2 and 3 implemented** (KSXT parsing, USB logging, shadow mode, speed observer, wheelbase self-calibration with WAS-sign detection, crab model, ground-speed pulse input with learned scale; nothing AgIO receives is changed). Phase 1 (live coast output) is design only and is the last step.
+
+**Phase 3 as built.** `COAST_SPEED_PULSE_PIN` (default −1 = off) counts pulses in an interrupt (100 µs glitch filter) and converts them to a raw speed every 50 ms from the pulse timestamps, using `COAST_PULSES_PER_M` (130 for ISO 11786). The core learns a scale factor against the GNSS axle speed (30 s low-pass, valid after 50 samples), projects the speed to the horizontal with `cos(pitch)`, and uses it whenever it is under 300 ms old; otherwise it falls back to the observer/hold. When the pin is 37 (`REMOTE_PIN`) the remote-switch read reports "open" and the encoder kickout is disabled automatically. **Hardware:** Teensy 4.1 pins are 3.3 V only; an ISO 11786 signal swings to battery voltage, so put a resistor divider (e.g. 10 kΩ / 3.3 kΩ) or an optocoupler in front of the pin, and check the tractor's connector pinout (pin 1 radar ground speed, pin 2 wheel speed). On the synthetic drive the pulse removes the straight-line speed hold entirely: the post-curve window goes from 7.9 m to 0.09 m along-track. Code: `zCoastCore.h/.c` (pure C core, also built by `tests/coast/run_tests.sh` against the Python reference model), `zCoast.ino` (glue), settings in the main sketch's user-settings block.
 
 **Findings from the synthetic drive (see §11 for how to read real numbers):**
 
